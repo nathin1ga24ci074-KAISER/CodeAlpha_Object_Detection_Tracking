@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Deep Learning / YOLO weights & runs
+*.pt
+*.onnx
+*.engine
+runs/
+weights/
+models/*
+!models/.gitkeep
+outputs/*
+!outputs/.gitkeep
+assets/*
+!assets/.gitkeep
+!assets/sample_bus.jpg
+!assets/sample_clip.mp4
+
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# Test & coverage
+.pytest_cache/
+.coverage
+htmlcov/
