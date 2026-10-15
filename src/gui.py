@@ -21,6 +21,7 @@ from PIL import Image, ImageTk
 from src.detector import YOLODetector
 from src.tracker import ObjectTracker, TrackedObject
 from src.video_source import VideoSource
+from src.scene_intelligence import SceneIntelligence
 from src.utils import (
     draw_bounding_box,
     draw_trajectory,
@@ -95,6 +96,7 @@ class TrackingWorker(threading.Thread):
 
             self.status_queue.put({"type": "status", "message": "Inference and tracking active."})
             fps_meter = FPSMeter()
+            scene_intel = SceneIntelligence()
             frame_idx = 0
 
             while self.is_running.is_set():
@@ -106,6 +108,14 @@ class TrackingWorker(threading.Thread):
                 frame_idx += 1
                 tracks = tracker.track(frame)
                 current_fps = fps_meter.tick()
+
+                fps_for_time = vs.fps if vs.fps > 0 else 30.0
+                intel_snap = scene_intel.update(
+                    frame_idx=frame_idx,
+                    tracks=tracks,
+                    timestamp_sec=frame_idx / fps_for_time,
+                    fps=fps_for_time
+                )
 
                 annotated = frame.copy()
                 active_classes = Counter()
@@ -136,7 +146,9 @@ class TrackingWorker(threading.Thread):
                     "active_count": tracker.get_active_count(),
                     "total_count": tracker.get_total_count(),
                     "class_counts": dict(active_classes),
-                    "frame_idx": frame_idx
+                    "frame_idx": frame_idx,
+                    "new_events": intel_snap.get("new_events", []),
+                    "scene_summary": scene_intel.generate_natural_language_summary()
                 }
 
                 try:
@@ -156,9 +168,16 @@ class TrackingWorker(threading.Thread):
                 vs.release()
             if writer is not None:
                 writer.release()
+            final_summary = "Tracking completed."
+            try:
+                scene_intel.finalize_stream(frame_idx)
+                final_summary = scene_intel.generate_natural_language_summary()
+            except Exception:
+                pass
             self.status_queue.put({
                 "type": "finished",
                 "output_file": out_file_path,
+                "summary": final_summary,
                 "message": "Tracking stopped. Resources released safely."
             })
 
@@ -368,9 +387,24 @@ class ObjectTrackerApp:
         self.lbl_total = tk.Label(card_tot, text="0", font=("Segoe UI", 18, "bold"), bg=self.CARD_BG, fg="#f1c40f")
         self.lbl_total.pack(anchor=tk.W)
 
+        # Card: Scene Intelligence Summary
+        card_scene = tk.Frame(parent, bg=self.CARD_BG, pady=6, padx=8)
+        card_scene.pack(fill=tk.X, padx=pad_x, pady=4)
+        tk.Label(card_scene, text="Scene Intelligence", font=("Segoe UI", 9, "bold"), bg=self.CARD_BG, fg=self.ACCENT_COLOR).pack(anchor=tk.W)
+        self.lbl_scene_summary = tk.Label(
+            card_scene,
+            text="Awaiting stream...",
+            font=("Segoe UI", 8),
+            bg=self.CARD_BG,
+            fg="#cdd6f4",
+            wraplength=210,
+            justify=tk.LEFT
+        )
+        self.lbl_scene_summary.pack(anchor=tk.W, pady=(2, 0))
+
         # Class Distribution list
         tk.Label(parent, text="Class Counts", font=("Segoe UI", 10, "bold"), bg=self.PANEL_BG, fg=self.ACCENT_COLOR).pack(anchor=tk.W, padx=pad_x, pady=(12, 4))
-        self.class_listbox = tk.Listbox(parent, bg="#11111b", fg=self.TEXT_COLOR, font=("Segoe UI", 9), height=7, relief=tk.FLAT)
+        self.class_listbox = tk.Listbox(parent, bg="#11111b", fg=self.TEXT_COLOR, font=("Segoe UI", 9), height=5, relief=tk.FLAT)
         self.class_listbox.pack(fill=tk.BOTH, expand=True, padx=pad_x, pady=(0, 10))
 
     def _on_source_mode_changed(self) -> None:
@@ -420,6 +454,7 @@ class ObjectTrackerApp:
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         self.status_badge.config(text="RUNNING", bg="#2ecc71")
+        self.lbl_scene_summary.config(text="Analyzing scene activity...")
         self.log(f"Starting tracking on {source}...")
 
         self.worker = TrackingWorker(
@@ -455,17 +490,23 @@ class ObjectTrackerApp:
                     self.log(msg["message"])
                     if msg.get("output_file"):
                         self.log(f"Saved: {msg['output_file']}")
+                    if msg.get("summary"):
+                        self.lbl_scene_summary.config(text=msg["summary"])
                     self.btn_start.config(state=tk.NORMAL)
                     self.btn_stop.config(state=tk.DISABLED)
                     self.status_badge.config(text="IDLE", bg="#45475a")
         except queue.Empty:
             pass
 
-        # Check latest frame update
+        # Check latest frame update and accumulate events
+        new_events_batch = []
         try:
             latest = None
             while True:
-                latest = self.output_queue.get_nowait()
+                item = self.output_queue.get_nowait()
+                if "new_events" in item and item["new_events"]:
+                    new_events_batch.extend(item["new_events"])
+                latest = item
         except queue.Empty:
             pass
 
@@ -474,6 +515,16 @@ class ObjectTrackerApp:
             self.lbl_fps.config(text=f"{latest['fps']}")
             self.lbl_active.config(text=f"{latest['active_count']}")
             self.lbl_total.config(text=f"{latest['total_count']}")
+
+            # Update scene intelligence summary card
+            if latest.get("scene_summary"):
+                self.lbl_scene_summary.config(text=latest["scene_summary"])
+
+            # Log events
+            for evt in new_events_batch:
+                desc = evt.get("description") if isinstance(evt, dict) else getattr(evt, "description", str(evt))
+                etype = evt.get("event_type", "EVENT") if isinstance(evt, dict) else getattr(evt, "event_type", "EVENT")
+                self.log(f"[{etype.upper()}] {desc}")
 
             self.class_listbox.delete(0, tk.END)
             for cls_name, count in sorted(latest["class_counts"].items()):

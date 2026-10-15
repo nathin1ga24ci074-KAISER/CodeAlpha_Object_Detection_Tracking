@@ -16,6 +16,7 @@ import numpy as np
 from src.detector import YOLODetector, DetectionResult
 from src.tracker import ObjectTracker, TrackedObject
 from src.video_source import VideoSource
+from src.scene_intelligence import SceneIntelligence
 from src.utils import draw_bounding_box, draw_trajectory, draw_hud, ColorPalette, FPSMeter
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
@@ -134,6 +135,7 @@ def run_video_tracking(
         device=device
     )
     tracker.load_model()
+    scene_intel = SceneIntelligence()
 
     writer: Optional[cv2.VideoWriter] = None
     out_file_path: Optional[str] = None
@@ -165,6 +167,14 @@ def run_video_tracking(
             frames_processed += 1
             tracks = tracker.track(frame)
             current_fps = fps_meter.tick()
+
+            fps_for_time = vs.fps if vs.fps > 0 else 30.0
+            scene_intel.update(
+                frame_idx=frames_processed,
+                tracks=tracks,
+                timestamp_sec=frames_processed / fps_for_time,
+                fps=fps_for_time
+            )
 
             annotated = frame.copy()
             active_class_counts: Counter = Counter()
@@ -211,6 +221,10 @@ def run_video_tracking(
         vs.release()
         if writer is not None:
             writer.release()
+        try:
+            scene_intel.finalize_stream(last_frame_idx=frames_processed)
+        except Exception:
+            pass
 
     total_duration = time.perf_counter() - t_start
     avg_fps = (frames_processed / total_duration) if total_duration > 0 else 0.0
@@ -237,7 +251,8 @@ def run_video_tracking(
         "total_unique_tracks": tracker.get_total_count(),
         "total_duration_sec": round(total_duration, 2),
         "average_fps": round(avg_fps, 2),
-        "tracks": sorted(track_summaries, key=lambda x: x["track_id"])
+        "tracks": sorted(track_summaries, key=lambda x: x["track_id"]),
+        "scene_intelligence": scene_intel.get_session_report()
     }
 
 
@@ -269,6 +284,7 @@ def run_webcam_tracking(
         device=device
     )
     tracker.load_model()
+    scene_intel = SceneIntelligence()
 
     writer: Optional[cv2.VideoWriter] = None
     out_file_path: Optional[str] = None
@@ -304,6 +320,14 @@ def run_webcam_tracking(
             frames_processed += 1
             tracks = tracker.track(frame)
             current_fps = fps_meter.tick()
+
+            fps_for_time = vs.fps if vs.fps > 0 else 30.0
+            scene_intel.update(
+                frame_idx=frames_processed,
+                tracks=tracks,
+                timestamp_sec=frames_processed / fps_for_time,
+                fps=fps_for_time
+            )
 
             annotated = frame.copy()
             active_class_counts: Counter = Counter()
@@ -359,6 +383,10 @@ def run_webcam_tracking(
             writer.release()
         if not headless:
             cv2.destroyAllWindows()
+        try:
+            scene_intel.finalize_stream(last_frame_idx=frames_processed)
+        except Exception:
+            pass
 
     total_duration = time.perf_counter() - t_start
     avg_fps = (frames_processed / total_duration) if total_duration > 0 else 0.0
@@ -385,7 +413,8 @@ def run_webcam_tracking(
         "total_unique_tracks": tracker.get_total_count(),
         "total_duration_sec": round(total_duration, 2),
         "average_fps": round(avg_fps, 2),
-        "tracks": sorted(track_summaries, key=lambda x: x["track_id"])
+        "tracks": sorted(track_summaries, key=lambda x: x["track_id"]),
+        "scene_intelligence": scene_intel.get_session_report()
     }
 
 
@@ -541,6 +570,16 @@ def main():
             f_range = f"Frame {t['first_frame']} -> {t['last_frame']}"
             print(f"#{t['track_id']:<9} {t['class_name']:<15} {t['frames_seen']:<15} {f_range:<20} {t['avg_confidence']*100:.1f}%")
         print("-" * 64)
+        if "scene_intelligence" in res:
+            intel = res["scene_intelligence"]
+            print("Scene Intelligence Summary:")
+            print(f"  {intel.get('natural_language_summary', 'N/A')}")
+            recent_evs = intel.get("recent_events", [])
+            if recent_evs:
+                print("\nEvent Timeline Highlights:")
+                for ev in recent_evs[-8:]:
+                    print(f"  [{ev['timestamp_sec']:>5.2f}s | Frame {ev['frame_idx']:>3}] {ev['description']}")
+            print("-" * 64)
         if res["output_video"]:
             print(f"Annotated video output saved to:\n  {res['output_video']}")
         print("=" * 64)
@@ -584,6 +623,16 @@ def main():
             f_range = f"Frame {t['first_frame']} -> {t['last_frame']}"
             print(f"#{t['track_id']:<9} {t['class_name']:<15} {t['frames_seen']:<15} {f_range:<20} {t['avg_confidence']*100:.1f}%")
         print("-" * 64)
+        if "scene_intelligence" in res:
+            intel = res["scene_intelligence"]
+            print("Scene Intelligence Summary:")
+            print(f"  {intel.get('natural_language_summary', 'N/A')}")
+            recent_evs = intel.get("recent_events", [])
+            if recent_evs:
+                print("\nEvent Timeline Highlights:")
+                for ev in recent_evs[-8:]:
+                    print(f"  [{ev['timestamp_sec']:>5.2f}s | Frame {ev['frame_idx']:>3}] {ev['description']}")
+            print("-" * 64)
         if res["output_video"]:
             print(f"Annotated webcam video saved to:\n  {res['output_video']}")
         print("=" * 64)

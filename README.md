@@ -7,7 +7,7 @@
 [![ByteTrack](https://img.shields.io/badge/Tracker-ByteTrack-orange.svg)](https://github.com/ifzhang/ByteTrack)
 [![OpenCV](https://img.shields.io/badge/OpenCV-5.x-red.svg)](https://opencv.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.14-ee4c2c.svg)](https://pytorch.org/)
-[![Tests](https://img.shields.io/badge/Tests-23%20Passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/Tests-36%20Passing-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
 ---
@@ -16,7 +16,7 @@
 
 This repository contains the complete implementation of **Task 4: Object Detection and Tracking** for the **CodeAlpha AI Internship**.
 
-The application detects, tracks, and monitors objects across consecutive video frames from **live webcams**, **prerecorded video files**, and **static photographs**. It integrates state-of-the-art **Ultralytics YOLO (YOLO11n)** for deep learning inference with **ByteTrack** for temporal ID association, accompanied by a **desktop GUI dashboard** and a **CLI interface**.
+The application detects, tracks, and monitors objects across consecutive video frames from **live webcams**, **prerecorded video files**, and **static photographs**. It integrates state-of-the-art **Ultralytics YOLO (YOLO11n)** for deep learning inference with **ByteTrack** for temporal ID association, accompanied by a **desktop GUI dashboard**, a **CLI interface**, and an **explainable Scene Intelligence engine**.
 
 > [!NOTE]
 > **Pretrained Weights & ID Semantics**: The system employs official pretrained COCO weights (`yolo11n.pt`). Tracking IDs (e.g., `#1`, `#2`) are temporal stream identifiers assigned dynamically across consecutive frames using Kalman filter state prediction and Hungarian linear assignment. They are valid for the duration of the stream and are not persistent biometric or biometric facial recognizers.
@@ -37,6 +37,7 @@ flowchart TD
         SourceMgr["VideoSource Context Manager\n(src/video_source.py)"]
         Detector["YOLODetector (YOLO11n)\n(src/detector.py)"]
         Tracker["ObjectTracker (ByteTrack)\n(src/tracker.py)"]
+        SceneIntel["SceneIntelligence Engine\n(src/scene_intelligence.py)"]
         Visualizer["Utils & HUD Engine\n(src/utils.py)"]
     end
 
@@ -52,8 +53,9 @@ flowchart TD
 
     SourceMgr --> Detector
     Detector --> Tracker
+    Tracker --> SceneIntel
     Tracker --> Visualizer
-
+    SceneIntel --> GUI
     Visualizer --> GUI
     Visualizer --> CLI_Window
     Visualizer --> DiskOutput
@@ -65,9 +67,10 @@ flowchart TD
 
 * **Real-Time Object Detection**: Inference with bounding boxes, confidence scores, and COCO class classifications via pretrained YOLO11n.
 * **ByteTrack Multi-Object Tracking**: Associative tracking preserving persistent IDs across consecutive frames with zero ID hopping.
+* **Explainable Scene Intelligence**: Snapshot counting, jitter-filtered motion direction estimation (Stationary, Left, Right, Up, Down), structured event timeline logging (`ENTERED`, `MOVED`, `EXITED`), and deterministic natural-language scene summaries without external LLM dependencies.
 * **Motion Trajectory Trails**: Centroid path visualization tracing the historical movement trajectory of each tracked entity.
 * **Live Analytics Heads-Up Display (HUD)**: On-screen telemetry showing real-time processing FPS, active track count, cumulative unique IDs, and per-class distribution.
-* **Interactive Desktop GUI Dashboard**: Dark-themed desktop dashboard built with Tkinter and Pillow featuring threaded video streaming, start/stop controls, and settings.
+* **Interactive Desktop GUI Dashboard**: Dark-themed desktop dashboard built with Tkinter and Pillow featuring threaded video streaming, start/stop controls, live scene intelligence cards, and real-time activity logs.
 * **Live Webcam Streaming**: Webcam integration supporting camera index selection and responsive `Q` / `Esc` keyboard exit handlers.
 * **Prerecorded Video Processing**: Process `.mp4`, `.avi`, `.mov`, and `.mkv` files with automated video export to `outputs/`.
 * **Single-Image Verification**: Fast CLI mode to verify detection accuracy on static photographs.
@@ -82,10 +85,11 @@ flowchart TD
 | **Language** | Python | `3.13.2` | Core programming language |
 | **Object Detection** | Ultralytics YOLO | `8.4.177` (YOLO11n) | Object detection & classification |
 | **Object Tracking** | ByteTrack / BoT-SORT | Built-in (`lap 0.5.13`) | Multi-object association & ID assignment |
+| **Scene Intelligence** | Pure Python & NumPy | Built-in | Centroid motion vectors, timeline events, explainable summaries |
 | **Computer Vision** | OpenCV (`opencv-python`) | `5.0.0` | Frame acquisition, image manipulation, DirectShow capture |
 | **Tensors** | PyTorch & Torchvision | `2.14.1+cpu` | Neural network computation (with CUDA fallback) |
 | **GUI Framework** | Tkinter + Pillow (`PIL`) | Built-in / `12.3.0` | Native desktop dashboard |
-| **Testing** | PyTest | `9.1.1` | Automated test suite (23 unit & integration tests) |
+| **Testing** | PyTest | `9.1.1` | Automated test suite (36 unit & integration tests) |
 
 ---
 
@@ -103,12 +107,14 @@ CodeAlpha_Object_Detection_Tracking/
 │   ├── __init__.py              # Package root
 │   ├── detector.py              # YOLODetector: model loader & inference engine
 │   ├── tracker.py               # ObjectTracker & TrackedObject: ByteTrack association
+│   ├── scene_intelligence.py   # SceneIntelligence: rule-based motion analytics & events
 │   ├── video_source.py          # VideoSource: webcam & file stream context manager
 │   ├── utils.py                 # HUD rendering, bounding boxes, palettes, FPS meter
 │   └── gui.py                   # Desktop GUI dashboard & background tracking worker
 ├── tests/
 │   ├── __init__.py              # Test suite init
-│   └── test_project_setup.py    # 23 automated unit and pipeline tests
+│   ├── test_project_setup.py    # 23 automated baseline and architecture tests
+│   └── test_scene_intelligence.py # 13 deterministic scene intelligence & analytics tests
 ├── assets/                      # Test media (sample_bus.jpg, sample_clip.mp4)
 ├── models/                      # Pretrained YOLO weights (yolo11n.pt) [git-ignored]
 └── outputs/                     # Annotated output videos & images [git-ignored]
@@ -229,20 +235,51 @@ All performance measurements below were executed on the actual host hardware (In
 
 ---
 
+## 🧠 Phase A — Advanced Scene Intelligence
+
+The system includes an explainable, rule-based **Scene Intelligence** layer ([`src/scene_intelligence.py`](src/scene_intelligence.py)) that sits on top of ByteTrack temporal association. It turns raw spatial coordinates into explainable metrics, temporal timeline events, and deterministic natural-language summaries.
+
+### 1. Scene Snapshot & Cumulative Metrics
+* Tracks currently visible objects per frame alongside total cumulative entities seen throughout the video session.
+* Maintains per-class counts (`person`, `car`, `dog`, etc.) updated every frame without duplicate ID inflation.
+
+### 2. Motion Direction Estimation & Jitter Suppression
+* Tracks Euclidean centroid displacement $(\Delta x, \Delta y)$ across a moving window:
+  $$\text{Displacement} = \sqrt{(\Delta x)^2 + (\Delta y)^2}$$
+* **Jitter Filter**: Centroid drift under $12.0\text{px}$ is categorized as `STATIONARY`, eliminating detection noise and bounding box jitter.
+* **Dominant Direction Axis**: When net movement $\ge 12.0\text{px}$, the engine decomposes motion into 4 coarse vectors:
+  * $|\Delta x| \ge |\Delta y|$: `MOVING_LEFT` ($\Delta x < 0$) or `MOVING_RIGHT` ($\Delta x > 0$)
+  * $|\Delta y| > |\Delta x|$: `MOVING_UP` ($\Delta y < 0$) or `MOVING_DOWN` ($\Delta y > 0$)
+
+### 3. Structured Event Timeline Logging
+Emits three deterministic event types logged to GUI and CLI feeds:
+* `ENTERED`: Emitted when a new tracking ID is first registered in the scene.
+* `MOVED`: Emitted when an entity exhibits persistent directional motion. Throttled (every 20 frames or on direction change) to prevent event flood.
+* `EXITED`: Emitted when an object disappears for $\ge 15$ consecutive frames, or when the video stream finalizes.
+
+### 4. Deterministic Natural-Language Summaries
+* Generates human-readable, factual summaries synthesized directly from tracked observations (e.g., *"Observed 5 distinct objects (4 persons, 1 bus) across 30 frames. Currently visible (5)... Motion highlights: #1 bus covered ~142px."*).
+* Zero ungrounded generative hallucinations: runs 100% locally on CPU without third-party LLM API keys.
+
+> [!NOTE]
+> **Explainability & Limitations**: Scene intelligence operates strictly within 2D image coordinates. Apparent motion reflects camera-plane pixel displacement rather than calibrated real-world velocity or 3D world motion. Stationary camera setups yield highest directional fidelity.
+
+---
+
 ## 🧪 Automated Test Suite
 
-A 23-point unit and integration test suite is located in [`tests/test_project_setup.py`](tests/test_project_setup.py).
+A 36-point unit and integration test suite is located in [`tests/test_project_setup.py`](tests/test_project_setup.py) and [`tests/test_scene_intelligence.py`](tests/test_scene_intelligence.py).
 
 ```powershell
 pytest tests/ -v
 ```
 
 ### Test Coverage Highlights:
-* **Environment & Compatibility**: Python version and package imports.
-* **Detector Logic**: Lazy loading, frame validation, geometry (`width`, `height`, `area`, `center`).
-* **Tracker Logic**: ByteTrack initialization, centroid trajectories, empty frame handling, and stream isolation.
-* **Video Pipeline**: Missing video errors, DirectShow webcam errors, and 5-frame real video tracking verification.
-* **GUI Architecture**: Threaded tracking worker lifecycle, safe message queues, and Tkinter window initialization.
+* **Environment & Compatibility (2 tests)**: Python version validation and dependency imports.
+* **Architecture & Detection (12 tests)**: Lazy model loading, frame validation, geometry (`width`, `height`, `area`, `center`), HUD pipeline, and CLI entrypoint helpers.
+* **Tracking & ByteTrack (6 tests)**: ByteTrack initialization, centroid trajectories, empty frame handling, stream isolation, and real video tracking on sample clip.
+* **Webcam & Desktop GUI (3 tests)**: DirectShow device error handling, threaded tracking worker lifecycle, and Tkinter UI initialization/teardown.
+* **Scene Intelligence & Analytics (13 tests)**: Empty detections handling, multi-class snapshot counting, jitter suppression, 4-direction motion estimation, missing history validation, disappearing object grace periods, stream finalization cleanup, duplicate movement throttling, session isolation/reset, natural-language summary traceability, malformed input fallbacks, and video tracking integration.
 
 ---
 
