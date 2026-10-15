@@ -9,7 +9,7 @@ import time
 import threading
 import queue
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from collections import Counter
 import cv2
 import numpy as np
@@ -22,6 +22,7 @@ from src.detector import YOLODetector
 from src.tracker import ObjectTracker, TrackedObject
 from src.video_source import VideoSource
 from src.scene_intelligence import SceneIntelligence
+from src.spatial_analytics import SpatialAnalytics
 from src.utils import (
     draw_bounding_box,
     draw_trajectory,
@@ -47,7 +48,9 @@ class TrackingWorker(threading.Thread):
         device: str,
         save_output: bool,
         output_queue: queue.Queue,
-        status_queue: queue.Queue
+        status_queue: queue.Queue,
+        virtual_line: Optional[Tuple[int, int, int, int]] = None,
+        roi_region: Optional[Tuple[int, int, int, int]] = None
     ):
         super().__init__(daemon=True)
         self.source = source
@@ -58,6 +61,8 @@ class TrackingWorker(threading.Thread):
         self.save_output = save_output
         self.output_queue = output_queue
         self.status_queue = status_queue
+        self.virtual_line = virtual_line
+        self.roi_region = roi_region
         self.is_running = threading.Event()
         self.is_running.set()
 
@@ -82,6 +87,15 @@ class TrackingWorker(threading.Thread):
                 device=self.device
             )
             tracker.load_model()
+
+            spatial_analytics = None
+            if self.virtual_line is not None or self.roi_region is not None:
+                spatial_analytics = SpatialAnalytics(
+                    virtual_line=self.virtual_line,
+                    roi_region=self.roi_region,
+                    frame_width=vs.width if vs.width > 0 else None,
+                    frame_height=vs.height if vs.height > 0 else None
+                )
 
             if self.save_output:
                 out_dir = Path(__file__).resolve().parent.parent / "outputs"
@@ -117,6 +131,17 @@ class TrackingWorker(threading.Thread):
                     fps=fps_for_time
                 )
 
+                spatial_snap = None
+                spatial_events = []
+                if spatial_analytics is not None:
+                    spatial_snap = spatial_analytics.update(
+                        frame_idx=frame_idx,
+                        tracks=tracks,
+                        timestamp_sec=frame_idx / fps_for_time,
+                        fps=fps_for_time
+                    )
+                    spatial_events = spatial_snap.get("new_events", [])
+
                 annotated = frame.copy()
                 active_classes = Counter()
 
@@ -127,6 +152,9 @@ class TrackingWorker(threading.Thread):
                     if len(t.trajectory) >= 2:
                         draw_trajectory(annotated, list(t.trajectory), color, thickness=2)
                     draw_bounding_box(annotated, t.box, label, color=color, thickness=2)
+
+                if spatial_analytics is not None:
+                    spatial_analytics.draw_overlays(annotated)
 
                 draw_hud(
                     annotated,
@@ -148,7 +176,9 @@ class TrackingWorker(threading.Thread):
                     "class_counts": dict(active_classes),
                     "frame_idx": frame_idx,
                     "new_events": intel_snap.get("new_events", []),
-                    "scene_summary": scene_intel.generate_natural_language_summary()
+                    "scene_summary": scene_intel.generate_natural_language_summary(),
+                    "spatial_snap": spatial_snap,
+                    "spatial_events": spatial_events
                 }
 
                 try:
@@ -174,6 +204,11 @@ class TrackingWorker(threading.Thread):
                 final_summary = scene_intel.generate_natural_language_summary()
             except Exception:
                 pass
+            if spatial_analytics is not None:
+                try:
+                    spatial_analytics.finalize_stream(frame_idx)
+                except Exception:
+                    pass
             self.status_queue.put({
                 "type": "finished",
                 "output_file": out_file_path,
@@ -340,7 +375,15 @@ class ObjectTrackerApp:
             parent, text="Save Annotated Output", variable=self.save_var,
             bg=self.PANEL_BG, fg=self.TEXT_COLOR, selectcolor=self.CARD_BG, activebackground=self.PANEL_BG
         )
-        cb_save.pack(anchor=tk.W, padx=pad_x, pady=(4, 12))
+        cb_save.pack(anchor=tk.W, padx=pad_x, pady=(4, 2))
+
+        # Spatial Analytics Checkbox
+        self.spatial_var = tk.BooleanVar(value=True)
+        cb_spatial = tk.Checkbutton(
+            parent, text="Virtual Line & ROI Analytics", variable=self.spatial_var,
+            bg=self.PANEL_BG, fg=self.TEXT_COLOR, selectcolor=self.CARD_BG, activebackground=self.PANEL_BG
+        )
+        cb_spatial.pack(anchor=tk.W, padx=pad_x, pady=(0, 10))
 
         # Start / Stop Control Buttons
         self.btn_start = tk.Button(
@@ -402,6 +445,27 @@ class ObjectTrackerApp:
         )
         self.lbl_scene_summary.pack(anchor=tk.W, pady=(2, 0))
 
+        # Card: Spatial Analytics
+        card_spatial = tk.Frame(parent, bg=self.CARD_BG, pady=6, padx=8)
+        card_spatial.pack(fill=tk.X, padx=pad_x, pady=4)
+        tk.Label(card_spatial, text="Spatial Analytics", font=("Segoe UI", 9, "bold"), bg=self.CARD_BG, fg=self.ACCENT_COLOR).pack(anchor=tk.W)
+        self.lbl_spatial_line = tk.Label(
+            card_spatial,
+            text="Line: 0 crosses",
+            font=("Segoe UI", 8),
+            bg=self.CARD_BG,
+            fg="#cdd6f4"
+        )
+        self.lbl_spatial_line.pack(anchor=tk.W, pady=(2, 0))
+        self.lbl_spatial_roi = tk.Label(
+            card_spatial,
+            text="ROI: 0 inside (In: 0 | Out: 0)",
+            font=("Segoe UI", 8),
+            bg=self.CARD_BG,
+            fg="#a6adc8"
+        )
+        self.lbl_spatial_roi.pack(anchor=tk.W, pady=(1, 0))
+
         # Class Distribution list
         tk.Label(parent, text="Class Counts", font=("Segoe UI", 10, "bold"), bg=self.PANEL_BG, fg=self.ACCENT_COLOR).pack(anchor=tk.W, padx=pad_x, pady=(12, 4))
         self.class_listbox = tk.Listbox(parent, bg="#11111b", fg=self.TEXT_COLOR, font=("Segoe UI", 9), height=5, relief=tk.FLAT)
@@ -457,6 +521,15 @@ class ObjectTrackerApp:
         self.lbl_scene_summary.config(text="Analyzing scene activity...")
         self.log(f"Starting tracking on {source}...")
 
+        virt_line = None
+        roi_reg = None
+        if self.spatial_var.get():
+            virt_line = (50, 240, 590, 240)
+            roi_reg = (120, 100, 520, 380)
+
+        self.lbl_spatial_line.config(text="Line: 0 crosses" if virt_line else "Line: inactive")
+        self.lbl_spatial_roi.config(text="ROI: 0 inside (In: 0 | Out: 0)" if roi_reg else "ROI: inactive")
+
         self.worker = TrackingWorker(
             source=source,
             model_name=self.model_var.get(),
@@ -465,7 +538,9 @@ class ObjectTrackerApp:
             device="cpu",
             save_output=self.save_var.get(),
             output_queue=self.output_queue,
-            status_queue=self.status_queue
+            status_queue=self.status_queue,
+            virtual_line=virt_line,
+            roi_region=roi_reg
         )
         self.worker.start()
 
@@ -500,12 +575,15 @@ class ObjectTrackerApp:
 
         # Check latest frame update and accumulate events
         new_events_batch = []
+        spatial_events_batch = []
         try:
             latest = None
             while True:
                 item = self.output_queue.get_nowait()
                 if "new_events" in item and item["new_events"]:
                     new_events_batch.extend(item["new_events"])
+                if "spatial_events" in item and item["spatial_events"]:
+                    spatial_events_batch.extend(item["spatial_events"])
                 latest = item
         except queue.Empty:
             pass
@@ -520,11 +598,33 @@ class ObjectTrackerApp:
             if latest.get("scene_summary"):
                 self.lbl_scene_summary.config(text=latest["scene_summary"])
 
+            # Update spatial analytics summary card
+            spatial_snap = latest.get("spatial_snap")
+            if spatial_snap:
+                if spatial_snap.get("virtual_line_configured"):
+                    tot = spatial_snap.get("line_crossings_total", 0)
+                    self.lbl_spatial_line.config(text=f"Line: {tot} crossings")
+                else:
+                    self.lbl_spatial_line.config(text="Line: not configured")
+
+                if spatial_snap.get("roi_configured"):
+                    occ = spatial_snap.get("roi_current_occupancy", 0)
+                    entries = spatial_snap.get("roi_entries_total", 0)
+                    exits = spatial_snap.get("roi_exits_total", 0)
+                    self.lbl_spatial_roi.config(text=f"ROI: {occ} inside (In: {entries} | Out: {exits})")
+                else:
+                    self.lbl_spatial_roi.config(text="ROI: not configured")
+
             # Log events
             for evt in new_events_batch:
                 desc = evt.get("description") if isinstance(evt, dict) else getattr(evt, "description", str(evt))
                 etype = evt.get("event_type", "EVENT") if isinstance(evt, dict) else getattr(evt, "event_type", "EVENT")
                 self.log(f"[{etype.upper()}] {desc}")
+
+            for sevt in spatial_events_batch:
+                sdesc = sevt.get("description") if isinstance(sevt, dict) else getattr(sevt, "description", str(sevt))
+                stype = sevt.get("event_type", "SPATIAL") if isinstance(sevt, dict) else getattr(sevt, "event_type", "SPATIAL")
+                self.log(f"[{stype.upper()}] {sdesc}")
 
             self.class_listbox.delete(0, tk.END)
             for cls_name, count in sorted(latest["class_counts"].items()):

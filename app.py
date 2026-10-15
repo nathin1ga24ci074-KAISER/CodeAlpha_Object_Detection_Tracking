@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 from collections import Counter
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List, Union, Tuple
 import cv2
 import numpy as np
 
@@ -17,6 +17,7 @@ from src.detector import YOLODetector, DetectionResult
 from src.tracker import ObjectTracker, TrackedObject
 from src.video_source import VideoSource
 from src.scene_intelligence import SceneIntelligence
+from src.spatial_analytics import SpatialAnalytics, parse_spatial_coords_string
 from src.utils import draw_bounding_box, draw_trajectory, draw_hud, ColorPalette, FPSMeter
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
@@ -112,10 +113,13 @@ def run_video_tracking(
     device: str = "cpu",
     save_path: Optional[Union[str, bool]] = None,
     max_frames: Optional[int] = None,
-    show_trajectories: bool = True
+    show_trajectories: bool = True,
+    virtual_line: Optional[Union[str, Tuple[int, int, int, int]]] = None,
+    roi_region: Optional[Union[str, Tuple[int, int, int, int]]] = None
 ) -> Dict[str, Any]:
     """
     Executes real YOLO detection and ByteTrack association on a prerecorded video file.
+    Optionally computes virtual line crossing and rectangular ROI analytics.
     """
     path = Path(video_path)
     if not path.exists():
@@ -136,6 +140,18 @@ def run_video_tracking(
     )
     tracker.load_model()
     scene_intel = SceneIntelligence()
+
+    # Spatial analytics initialization
+    spatial_analytics = None
+    line_coords = parse_spatial_coords_string(virtual_line) if isinstance(virtual_line, str) else virtual_line
+    roi_coords = parse_spatial_coords_string(roi_region) if isinstance(roi_region, str) else roi_region
+    if line_coords is not None or roi_coords is not None:
+        spatial_analytics = SpatialAnalytics(
+            virtual_line=line_coords,
+            roi_region=roi_coords,
+            frame_width=vs.width if vs.width > 0 else None,
+            frame_height=vs.height if vs.height > 0 else None
+        )
 
     writer: Optional[cv2.VideoWriter] = None
     out_file_path: Optional[str] = None
@@ -175,6 +191,13 @@ def run_video_tracking(
                 timestamp_sec=frames_processed / fps_for_time,
                 fps=fps_for_time
             )
+            if spatial_analytics is not None:
+                spatial_analytics.update(
+                    frame_idx=frames_processed,
+                    tracks=tracks,
+                    timestamp_sec=frames_processed / fps_for_time,
+                    fps=fps_for_time
+                )
 
             annotated = frame.copy()
             active_class_counts: Counter = Counter()
@@ -203,6 +226,10 @@ def run_video_tracking(
                     track_history[t.track_id]["frames_seen"] += 1
                     track_history[t.track_id]["conf_sum"] += t.confidence
 
+            # Render spatial overlays if active
+            if spatial_analytics is not None:
+                spatial_analytics.draw_overlays(annotated)
+
             draw_hud(
                 annotated,
                 fps=current_fps,
@@ -225,6 +252,11 @@ def run_video_tracking(
             scene_intel.finalize_stream(last_frame_idx=frames_processed)
         except Exception:
             pass
+        if spatial_analytics is not None:
+            try:
+                spatial_analytics.finalize_stream(last_frame_idx=frames_processed)
+            except Exception:
+                pass
 
     total_duration = time.perf_counter() - t_start
     avg_fps = (frames_processed / total_duration) if total_duration > 0 else 0.0
@@ -252,7 +284,8 @@ def run_video_tracking(
         "total_duration_sec": round(total_duration, 2),
         "average_fps": round(avg_fps, 2),
         "tracks": sorted(track_summaries, key=lambda x: x["track_id"]),
-        "scene_intelligence": scene_intel.get_session_report()
+        "scene_intelligence": scene_intel.get_session_report(),
+        "spatial_analytics": spatial_analytics.get_summary() if spatial_analytics is not None else None
     }
 
 
@@ -265,11 +298,14 @@ def run_webcam_tracking(
     save_path: Optional[Union[str, bool]] = None,
     max_frames: Optional[int] = None,
     show_trajectories: bool = True,
-    headless: bool = False
+    headless: bool = False,
+    virtual_line: Optional[Union[str, Tuple[int, int, int, int]]] = None,
+    roi_region: Optional[Union[str, Tuple[int, int, int, int]]] = None
 ) -> Dict[str, Any]:
     """
     Executes live YOLO detection and ByteTrack association on an interactive webcam stream.
     Displays OpenCV visualization window with 'Q' or 'ESC' exit handlers.
+    Optionally computes virtual line crossing and rectangular ROI analytics.
     """
     vs = VideoSource(webcam_id)
     try:
@@ -285,6 +321,18 @@ def run_webcam_tracking(
     )
     tracker.load_model()
     scene_intel = SceneIntelligence()
+
+    # Spatial analytics initialization
+    spatial_analytics = None
+    line_coords = parse_spatial_coords_string(virtual_line) if isinstance(virtual_line, str) else virtual_line
+    roi_coords = parse_spatial_coords_string(roi_region) if isinstance(roi_region, str) else roi_region
+    if line_coords is not None or roi_coords is not None:
+        spatial_analytics = SpatialAnalytics(
+            virtual_line=line_coords,
+            roi_region=roi_coords,
+            frame_width=vs.width if vs.width > 0 else None,
+            frame_height=vs.height if vs.height > 0 else None
+        )
 
     writer: Optional[cv2.VideoWriter] = None
     out_file_path: Optional[str] = None
@@ -328,6 +376,13 @@ def run_webcam_tracking(
                 timestamp_sec=frames_processed / fps_for_time,
                 fps=fps_for_time
             )
+            if spatial_analytics is not None:
+                spatial_analytics.update(
+                    frame_idx=frames_processed,
+                    tracks=tracks,
+                    timestamp_sec=frames_processed / fps_for_time,
+                    fps=fps_for_time
+                )
 
             annotated = frame.copy()
             active_class_counts: Counter = Counter()
@@ -355,6 +410,10 @@ def run_webcam_tracking(
                     track_history[t.track_id]["last_frame"] = frames_processed
                     track_history[t.track_id]["frames_seen"] += 1
                     track_history[t.track_id]["conf_sum"] += t.confidence
+
+            # Render spatial overlays if active
+            if spatial_analytics is not None:
+                spatial_analytics.draw_overlays(annotated)
 
             draw_hud(
                 annotated,
@@ -387,6 +446,11 @@ def run_webcam_tracking(
             scene_intel.finalize_stream(last_frame_idx=frames_processed)
         except Exception:
             pass
+        if spatial_analytics is not None:
+            try:
+                spatial_analytics.finalize_stream(last_frame_idx=frames_processed)
+            except Exception:
+                pass
 
     total_duration = time.perf_counter() - t_start
     avg_fps = (frames_processed / total_duration) if total_duration > 0 else 0.0
@@ -414,7 +478,8 @@ def run_webcam_tracking(
         "total_duration_sec": round(total_duration, 2),
         "average_fps": round(avg_fps, 2),
         "tracks": sorted(track_summaries, key=lambda x: x["track_id"]),
-        "scene_intelligence": scene_intel.get_session_report()
+        "scene_intelligence": scene_intel.get_session_report(),
+        "spatial_analytics": spatial_analytics.get_summary() if spatial_analytics is not None else None
     }
 
 
@@ -465,6 +530,23 @@ def parse_args():
         type=int,
         default=None,
         help="Optional maximum number of video frames to process"
+    )
+    parser.add_argument(
+        "--line",
+        type=str,
+        default=None,
+        help="Virtual line coordinates 'x1,y1,x2,y2' for crossing detection"
+    )
+    parser.add_argument(
+        "--roi",
+        type=str,
+        default=None,
+        help="Rectangular ROI coordinates 'x1,y1,x2,y2' for occupancy/entry/exit analytics"
+    )
+    parser.add_argument(
+        "--spatial-demo",
+        action="store_true",
+        help="Enable default demonstration virtual line and ROI for video/webcam tracking"
     )
     parser.add_argument(
         "--headless",
@@ -542,9 +624,23 @@ def main():
         print(f"Tracker:      {args.tracker}")
         print(f"Confidence:   {args.conf}")
         print(f"Device:       {args.device}")
+        if args.line:
+            print(f"Virtual Line: {args.line}")
+        if args.roi:
+            print(f"ROI Region:   {args.roi}")
+        if args.spatial_demo:
+            print("Spatial Demo: Enabled (Default demo line and ROI active)")
         if args.max_frames:
             print(f"Max frames:   {args.max_frames}")
         print("Processing video stream with ByteTrack...")
+
+        line_arg = args.line
+        roi_arg = args.roi
+        if args.spatial_demo:
+            if line_arg is None:
+                line_arg = "50,300,590,300"
+            if roi_arg is None:
+                roi_arg = "100,150,540,420"
 
         try:
             res = run_video_tracking(
@@ -554,7 +650,9 @@ def main():
                 conf_threshold=args.conf,
                 device=args.device,
                 save_path=save_dest,
-                max_frames=args.max_frames
+                max_frames=args.max_frames,
+                virtual_line=line_arg,
+                roi_region=roi_arg
             )
         except Exception as err:
             print(f"\n[ERROR] Tracking failed: {err}", file=sys.stderr)
@@ -580,6 +678,28 @@ def main():
                 for ev in recent_evs[-8:]:
                     print(f"  [{ev['timestamp_sec']:>5.2f}s | Frame {ev['frame_idx']:>3}] {ev['description']}")
             print("-" * 64)
+        if res.get("spatial_analytics"):
+            spatial = res["spatial_analytics"]
+            print("Spatial Analytics Summary:")
+            if spatial.get("virtual_line"):
+                line_data = spatial["line_crossings"]
+                print(f"  Virtual Line Crossings: {line_data['total']} total")
+                print(f"    By Direction: {line_data['by_direction']}")
+                print(f"    By Class:     {line_data['by_class']}")
+            if spatial.get("roi_region"):
+                roi_data = spatial["roi_occupancy"]
+                print(f"  Rectangular ROI Occupancy:")
+                print(f"    Current Inside:     {roi_data['current_inside']}")
+                print(f"    Cumulative Entries: {roi_data['entries_total']} (By class: {roi_data['entries_by_class']})")
+                print(f"    Cumulative Exits:   {roi_data['exits_total']} (By class: {roi_data['exits_by_class']})")
+                if roi_data.get('terminated_inside'):
+                    print(f"    Terminated Inside:  {roi_data['terminated_inside']} (Not counted as exits)")
+            recent_spatial = spatial.get("recent_events", [])
+            if recent_spatial:
+                print("\nSpatial Events Timeline:")
+                for ev in recent_spatial[-8:]:
+                    print(f"  [{ev['timestamp_sec']:>5.2f}s | Frame {ev['frame_idx']:>3}] {ev['description']}")
+            print("-" * 64)
         if res["output_video"]:
             print(f"Annotated video output saved to:\n  {res['output_video']}")
         print("=" * 64)
@@ -596,9 +716,23 @@ def main():
         print(f"Tracker:      {args.tracker}")
         print(f"Confidence:   {args.conf}")
         print(f"Device:       {args.device}")
+        if args.line:
+            print(f"Virtual Line: {args.line}")
+        if args.roi:
+            print(f"ROI Region:   {args.roi}")
+        if args.spatial_demo:
+            print("Spatial Demo: Enabled (Default demo line and ROI active)")
         if not args.headless:
             print("Display:      OpenCV live window (Press 'q' or 'Esc' to quit)")
         print("Opening webcam stream...")
+
+        line_arg = args.line
+        roi_arg = args.roi
+        if args.spatial_demo:
+            if line_arg is None:
+                line_arg = "50,240,590,240"
+            if roi_arg is None:
+                roi_arg = "120,100,520,380"
 
         try:
             res = run_webcam_tracking(
@@ -609,7 +743,9 @@ def main():
                 device=args.device,
                 save_path=save_dest,
                 max_frames=args.max_frames,
-                headless=args.headless
+                headless=args.headless,
+                virtual_line=line_arg,
+                roi_region=roi_arg
             )
         except Exception as err:
             print(f"\n[ERROR] Webcam tracking failed: {err}", file=sys.stderr)
@@ -631,6 +767,28 @@ def main():
             if recent_evs:
                 print("\nEvent Timeline Highlights:")
                 for ev in recent_evs[-8:]:
+                    print(f"  [{ev['timestamp_sec']:>5.2f}s | Frame {ev['frame_idx']:>3}] {ev['description']}")
+            print("-" * 64)
+        if res.get("spatial_analytics"):
+            spatial = res["spatial_analytics"]
+            print("Spatial Analytics Summary:")
+            if spatial.get("virtual_line"):
+                line_data = spatial["line_crossings"]
+                print(f"  Virtual Line Crossings: {line_data['total']} total")
+                print(f"    By Direction: {line_data['by_direction']}")
+                print(f"    By Class:     {line_data['by_class']}")
+            if spatial.get("roi_region"):
+                roi_data = spatial["roi_occupancy"]
+                print(f"  Rectangular ROI Occupancy:")
+                print(f"    Current Inside:     {roi_data['current_inside']}")
+                print(f"    Cumulative Entries: {roi_data['entries_total']} (By class: {roi_data['entries_by_class']})")
+                print(f"    Cumulative Exits:   {roi_data['exits_total']} (By class: {roi_data['exits_by_class']})")
+                if roi_data.get('terminated_inside'):
+                    print(f"    Terminated Inside:  {roi_data['terminated_inside']} (Not counted as exits)")
+            recent_spatial = spatial.get("recent_events", [])
+            if recent_spatial:
+                print("\nSpatial Events Timeline:")
+                for ev in recent_spatial[-8:]:
                     print(f"  [{ev['timestamp_sec']:>5.2f}s | Frame {ev['frame_idx']:>3}] {ev['description']}")
             print("-" * 64)
         if res["output_video"]:
