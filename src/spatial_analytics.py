@@ -5,7 +5,7 @@ occupancy analytics, directional classification, boundary hysteresis, and struct
 """
 
 from typing import List, Dict, Any, Optional, Tuple, Set, Union
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 import math
 import cv2
 import numpy as np
@@ -26,6 +26,85 @@ class RegionState:
     OUTSIDE = "OUTSIDE"
     INSIDE = "INSIDE"
     TERMINATED_INSIDE = "TERMINATED_INSIDE"
+
+
+class ROIVisitStatus:
+    """Status lifecycle designations for ROI visits."""
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    TERMINATED_INSIDE = "TERMINATED_INSIDE"
+
+
+class ROIVisitRecord:
+    """
+    Structured visit record tracking an object's dwell duration within an ROI.
+    """
+
+    def __init__(
+        self,
+        track_id: int,
+        class_name: str,
+        entry_frame: int,
+        entry_timestamp: float,
+        exit_frame: Optional[int] = None,
+        exit_timestamp: Optional[float] = None,
+        dwell_duration_sec: float = 0.0,
+        status: str = ROIVisitStatus.IN_PROGRESS
+    ):
+        self.track_id = int(track_id)
+        self.class_name = str(class_name)
+        self.entry_frame = int(entry_frame)
+        self.entry_timestamp = round(float(entry_timestamp), 2)
+        self.exit_frame = int(exit_frame) if exit_frame is not None else None
+        self.exit_timestamp = round(float(exit_timestamp), 2) if exit_timestamp is not None else None
+        self.dwell_duration_sec = max(0.0, round(float(dwell_duration_sec), 2))
+        self.status = str(status)
+
+    def complete(self, exit_frame: int, exit_timestamp: float) -> None:
+        """Marks visit as completed upon confirmed geometric exit from ROI."""
+        self.status = ROIVisitStatus.COMPLETED
+        self.exit_frame = int(exit_frame)
+        self.exit_timestamp = round(float(exit_timestamp), 2)
+        duration = self.exit_timestamp - self.entry_timestamp
+        self.dwell_duration_sec = max(0.0, round(duration, 2))
+
+    def terminate_inside(self, term_frame: int, term_timestamp: float) -> None:
+        """Marks visit as terminated while still inside ROI (track loss or stream end)."""
+        self.status = ROIVisitStatus.TERMINATED_INSIDE
+        self.exit_frame = int(term_frame)
+        self.exit_timestamp = round(float(term_timestamp), 2)
+        duration = self.exit_timestamp - self.entry_timestamp
+        self.dwell_duration_sec = max(0.0, round(duration, 2))
+
+    def get_current_duration(self, current_timestamp: float) -> float:
+        """Calculates current elapsed dwell duration for an in-progress visit."""
+        if self.status != ROIVisitStatus.IN_PROGRESS:
+            return self.dwell_duration_sec
+        return max(0.0, round(float(current_timestamp) - self.entry_timestamp, 2))
+
+    def to_dict(self, current_ts: Optional[float] = None) -> Dict[str, Any]:
+        duration = self.dwell_duration_sec
+        if self.status == ROIVisitStatus.IN_PROGRESS and current_ts is not None:
+            duration = self.get_current_duration(current_ts)
+
+        return {
+            "track_id": self.track_id,
+            "class_name": self.class_name,
+            "status": self.status,
+            "entry_frame": self.entry_frame,
+            "entry_timestamp": self.entry_timestamp,
+            "exit_frame": self.exit_frame,
+            "exit_timestamp": self.exit_timestamp,
+            "dwell_duration_sec": duration
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"ROIVisitRecord(#{self.track_id} {self.class_name} [{self.status}]: "
+            f"entry={self.entry_frame} ({self.entry_timestamp}s), "
+            f"exit={self.exit_frame} ({self.exit_timestamp}s), "
+            f"dwell={self.dwell_duration_sec}s)"
+        )
 
 
 class SpatialEvent:
@@ -154,10 +233,18 @@ def parse_spatial_coords_string(coord_str: str) -> Tuple[int, int, int, int]:
 class TrackSpatialState:
     """Internal spatial tracking state maintained for each persistent object ID."""
 
-    def __init__(self, track_id: int, class_name: str, initial_centroid: Tuple[int, int], frame_idx: int):
+    def __init__(
+        self,
+        track_id: int,
+        class_name: str,
+        initial_centroid: Tuple[int, int],
+        frame_idx: int,
+        timestamp_sec: float = 0.0
+    ):
         self.track_id = int(track_id)
         self.class_name = str(class_name)
         self.last_seen_frame = int(frame_idx)
+        self.last_seen_timestamp = float(timestamp_sec)
         self.frames_unseen = 0
         self.centroid_history: deque = deque(maxlen=20)
         self.centroid_history.append(initial_centroid)
@@ -179,6 +266,7 @@ class SpatialAnalytics:
     - Virtual line crossings with directional classification and hysteresis
     - Rectangular Region of Interest (ROI) occupancy, entry, and exit
     - Class-specific cumulative and instantaneous telemetry
+    - ROI dwell time analytics and peak occupancy records
     - Chronological, bounded event logging
     """
 
@@ -192,6 +280,7 @@ class SpatialAnalytics:
         roi_cooldown_frames: int = 5,
         disappearance_grace_frames: int = 10,
         max_events_history: int = 250,
+        max_visits_history: int = 500,
         frame_width: Optional[int] = None,
         frame_height: Optional[int] = None
     ):
@@ -201,6 +290,7 @@ class SpatialAnalytics:
         self.roi_cooldown_frames = max(1, int(roi_cooldown_frames))
         self.disappearance_grace_frames = max(1, int(disappearance_grace_frames))
         self.max_events_history = max(1, int(max_events_history))
+        self.max_visits_history = max(1, int(max_visits_history))
         self.frame_width = frame_width
         self.frame_height = frame_height
 
@@ -230,6 +320,24 @@ class SpatialAnalytics:
         self._roi_exits_by_class: Counter = Counter()
         self._roi_terminated_inside_total: int = 0
 
+        # ROI visit and dwell tracking
+        self._active_roi_visits: Dict[int, ROIVisitRecord] = {}
+        self._completed_roi_visits: List[ROIVisitRecord] = []
+        self._terminated_roi_visits: List[ROIVisitRecord] = []
+
+        # Completed dwell statistics (running totals preserved against history pruning)
+        self._completed_dwell_count: int = 0
+        self._total_completed_dwell_sec: float = 0.0
+        self._completed_dwell_count_by_class: Counter = Counter()
+        self._total_completed_dwell_by_class: Dict[str, float] = defaultdict(float)
+        self._min_completed_dwell_sec: Optional[float] = None
+        self._max_completed_dwell_sec: Optional[float] = None
+
+        # Peak occupancy tracking
+        self._peak_roi_occupancy: int = 0
+        self._peak_roi_frame: Optional[int] = None
+        self._peak_roi_timestamp: Optional[float] = None
+
         self._latest_frame_idx: int = 0
         self._latest_timestamp: float = 0.0
 
@@ -255,6 +363,21 @@ class SpatialAnalytics:
         self._roi_exits_total = 0
         self._roi_exits_by_class.clear()
         self._roi_terminated_inside_total = 0
+
+        self._active_roi_visits.clear()
+        self._completed_roi_visits.clear()
+        self._terminated_roi_visits.clear()
+        self._completed_dwell_count = 0
+        self._total_completed_dwell_sec = 0.0
+        self._completed_dwell_count_by_class.clear()
+        self._total_completed_dwell_by_class.clear()
+        self._min_completed_dwell_sec = None
+        self._max_completed_dwell_sec = None
+
+        self._peak_roi_occupancy = 0
+        self._peak_roi_frame = None
+        self._peak_roi_timestamp = None
+
         self._latest_frame_idx = 0
         self._latest_timestamp = 0.0
 
@@ -475,6 +598,15 @@ class SpatialAnalytics:
             self._roi_entries_total += 1
             self._roi_entries_by_class[state.class_name] += 1
 
+            # Start active ROI visit record
+            visit = ROIVisitRecord(
+                track_id=state.track_id,
+                class_name=state.class_name,
+                entry_frame=frame_idx,
+                entry_timestamp=timestamp_sec
+            )
+            self._active_roi_visits[state.track_id] = visit
+
             desc = (
                 f"{state.class_name.capitalize()} #{state.track_id} entered ROI "
                 f"at ({cx}, {cy})."
@@ -486,7 +618,11 @@ class SpatialAnalytics:
                 frame_idx=frame_idx,
                 timestamp_sec=timestamp_sec,
                 description=desc,
-                details={"centroid": curr_centroid, "roi": self.roi_region}
+                details={
+                    "centroid": curr_centroid,
+                    "roi": self.roi_region,
+                    "visit_status": ROIVisitStatus.IN_PROGRESS
+                }
             )
 
         # Transition 2: INSIDE -> OUTSIDE (Geometric boundary crossing only)
@@ -496,6 +632,26 @@ class SpatialAnalytics:
             self._roi_current_inside.discard(state.track_id)
             self._roi_exits_total += 1
             self._roi_exits_by_class[state.class_name] += 1
+
+            # Complete active ROI visit record
+            dwell_sec = 0.0
+            visit = self._active_roi_visits.pop(state.track_id, None)
+            if visit is not None:
+                visit.complete(frame_idx, timestamp_sec)
+                dwell_sec = visit.dwell_duration_sec
+                self._completed_roi_visits.append(visit)
+                if len(self._completed_roi_visits) > self.max_visits_history:
+                    self._completed_roi_visits.pop(0)
+
+                # Update cumulative completed dwell metrics
+                self._completed_dwell_count += 1
+                self._total_completed_dwell_sec += dwell_sec
+                self._completed_dwell_count_by_class[state.class_name] += 1
+                self._total_completed_dwell_by_class[state.class_name] += dwell_sec
+                if self._min_completed_dwell_sec is None or dwell_sec < self._min_completed_dwell_sec:
+                    self._min_completed_dwell_sec = dwell_sec
+                if self._max_completed_dwell_sec is None or dwell_sec > self._max_completed_dwell_sec:
+                    self._max_completed_dwell_sec = dwell_sec
 
             desc = (
                 f"{state.class_name.capitalize()} #{state.track_id} exited ROI "
@@ -508,7 +664,12 @@ class SpatialAnalytics:
                 frame_idx=frame_idx,
                 timestamp_sec=timestamp_sec,
                 description=desc,
-                details={"centroid": curr_centroid, "roi": self.roi_region}
+                details={
+                    "centroid": curr_centroid,
+                    "roi": self.roi_region,
+                    "dwell_duration_sec": dwell_sec,
+                    "visit_status": ROIVisitStatus.COMPLETED
+                }
             )
 
         return None
@@ -530,13 +691,21 @@ class SpatialAnalytics:
             fps: Video framerate for timestamp fallback.
 
         Returns:
-            Dict[str, Any]: Frame spatial analytics snapshot.
+            Dict[str, Any]: Frame spatial analytics snapshot with dwell and peak telemetry.
         """
         self._latest_frame_idx = frame_idx
         if timestamp_sec is not None:
-            ts = float(timestamp_sec)
+            try:
+                ts_val = float(timestamp_sec)
+                if math.isfinite(ts_val) and ts_val >= 0.0:
+                    ts = ts_val
+                else:
+                    ts = (frame_idx / fps) if fps > 0 else float(frame_idx)
+            except (ValueError, TypeError):
+                ts = (frame_idx / fps) if fps > 0 else float(frame_idx)
         else:
             ts = (frame_idx / fps) if fps > 0 else float(frame_idx)
+        ts = max(0.0, ts)
         self._latest_timestamp = ts
 
         active_track_ids = set()
@@ -566,11 +735,12 @@ class SpatialAnalytics:
             centroid = (int(centroid[0]), int(centroid[1]))
 
             if tid not in self._tracks:
-                state = TrackSpatialState(tid, cname, centroid, frame_idx)
+                state = TrackSpatialState(tid, cname, centroid, frame_idx, ts)
                 self._tracks[tid] = state
             else:
                 state = self._tracks[tid]
                 state.last_seen_frame = frame_idx
+                state.last_seen_timestamp = ts
                 state.frames_unseen = 0
                 state.centroid_history.append(centroid)
 
@@ -596,11 +766,32 @@ class SpatialAnalytics:
                         self._roi_current_inside.discard(tid)
                         self._roi_terminated_inside_total += 1
 
+                        visit = self._active_roi_visits.pop(tid, None)
+                        if visit is not None:
+                            term_frame = state.last_seen_frame
+                            term_ts = state.last_seen_timestamp
+                            visit.terminate_inside(term_frame, term_ts)
+                            self._terminated_roi_visits.append(visit)
+                            if len(self._terminated_roi_visits) > self.max_visits_history:
+                                self._terminated_roi_visits.pop(0)
+
         # Current counts inside ROI by class
         current_roi_classes = Counter()
         for tid in self._roi_current_inside:
             if tid in self._tracks:
                 current_roi_classes[self._tracks[tid].class_name] += 1
+
+        # 3. Update peak ROI occupancy
+        current_occupancy = len(self._roi_current_inside)
+        if current_occupancy > self._peak_roi_occupancy:
+            self._peak_roi_occupancy = current_occupancy
+            self._peak_roi_frame = frame_idx
+            self._peak_roi_timestamp = round(ts, 2)
+
+        roi_avg_dwell = (
+            round(self._total_completed_dwell_sec / self._completed_dwell_count, 2)
+            if self._completed_dwell_count > 0 else 0.0
+        )
 
         return {
             "frame_idx": frame_idx,
@@ -610,13 +801,18 @@ class SpatialAnalytics:
             "line_crossings_total": self._line_crossings_total,
             "line_crossings_by_direction": dict(self._line_crossings_by_direction),
             "line_crossings_by_class": dict(self._line_crossings_by_class),
-            "roi_current_occupancy": len(self._roi_current_inside),
+            "roi_current_occupancy": current_occupancy,
             "roi_current_classes": dict(current_roi_classes),
+            "roi_peak_occupancy": self._peak_roi_occupancy,
+            "roi_peak_frame": self._peak_roi_frame,
+            "roi_peak_timestamp": self._peak_roi_timestamp,
             "roi_entries_total": self._roi_entries_total,
             "roi_entries_by_class": dict(self._roi_entries_by_class),
             "roi_exits_total": self._roi_exits_total,
             "roi_exits_by_class": dict(self._roi_exits_by_class),
             "roi_terminated_inside": self._roi_terminated_inside_total,
+            "roi_completed_visits": self._completed_dwell_count,
+            "roi_avg_dwell_sec": roi_avg_dwell,
             "new_events": [e.to_dict() for e in new_events],
             "total_events_logged": len(self._events)
         }
@@ -630,13 +826,84 @@ class SpatialAnalytics:
         Cleans up stream session. Crucially, objects remaining inside ROI at end of stream
         are marked as TERMINATED_INSIDE without false ROI_EXIT emissions.
         """
+        end_frame = last_frame_idx if last_frame_idx is not None else self._latest_frame_idx
+        end_ts = timestamp_sec if timestamp_sec is not None else self._latest_timestamp
+
         for tid, state in self._tracks.items():
             if state.region_state == RegionState.INSIDE:
                 state.region_state = RegionState.TERMINATED_INSIDE
                 state.terminated_inside = True
                 self._roi_current_inside.discard(tid)
                 self._roi_terminated_inside_total += 1
+
+                visit = self._active_roi_visits.pop(tid, None)
+                if visit is not None:
+                    term_f = end_frame if end_frame is not None else state.last_seen_frame
+                    term_t = end_ts if end_ts is not None else state.last_seen_timestamp
+                    visit.terminate_inside(term_f, term_t)
+                    self._terminated_roi_visits.append(visit)
+                    if len(self._terminated_roi_visits) > self.max_visits_history:
+                        self._terminated_roi_visits.pop(0)
+
         return []
+
+    def get_dwell_summary(self) -> Dict[str, Any]:
+        """
+        Returns structured telemetry for ROI dwell times and peak occupancy.
+        """
+        avg_by_class = {}
+        for c, cnt in self._completed_dwell_count_by_class.items():
+            if cnt > 0:
+                avg_by_class[c] = round(self._total_completed_dwell_by_class[c] / cnt, 2)
+
+        avg_completed = (
+            round(self._total_completed_dwell_sec / self._completed_dwell_count, 2)
+            if self._completed_dwell_count > 0 else 0.0
+        )
+
+        return {
+            "current_inside_count": len(self._roi_current_inside),
+            "peak_occupancy": self._peak_roi_occupancy,
+            "peak_frame": self._peak_roi_frame,
+            "peak_timestamp": self._peak_roi_timestamp,
+            "completed_visits_count": self._completed_dwell_count,
+            "total_completed_dwell_sec": round(self._total_completed_dwell_sec, 2),
+            "avg_completed_dwell_sec": avg_completed,
+            "min_completed_dwell_sec": (
+                round(self._min_completed_dwell_sec, 2)
+                if self._min_completed_dwell_sec is not None else 0.0
+            ),
+            "max_completed_dwell_sec": (
+                round(self._max_completed_dwell_sec, 2)
+                if self._max_completed_dwell_sec is not None else 0.0
+            ),
+            "avg_completed_dwell_by_class": avg_by_class,
+            "terminated_inside_count": self._roi_terminated_inside_total,
+            "active_visits": [
+                v.to_dict(current_ts=self._latest_timestamp)
+                for v in self._active_roi_visits.values()
+            ],
+            "recent_completed_visits": [v.to_dict() for v in self._completed_roi_visits[-10:]],
+            "recent_terminated_visits": [v.to_dict() for v in self._terminated_roi_visits[-10:]]
+        }
+
+    def get_active_roi_visits(self) -> List[Dict[str, Any]]:
+        """Returns all currently active (in-progress) ROI visits."""
+        return [v.to_dict(current_ts=self._latest_timestamp) for v in self._active_roi_visits.values()]
+
+    def get_completed_roi_visits(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Returns completed ROI visits, optionally limited to the most recent."""
+        visits = self._completed_roi_visits
+        if limit is not None:
+            visits = visits[-limit:]
+        return [v.to_dict() for v in visits]
+
+    def get_terminated_roi_visits(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Returns visits terminated inside ROI without geometric exit."""
+        visits = self._terminated_roi_visits
+        if limit is not None:
+            visits = visits[-limit:]
+        return [v.to_dict() for v in visits]
 
     def get_events(
         self,
@@ -658,6 +925,8 @@ class SpatialAnalytics:
             if tid in self._tracks:
                 current_roi_classes[self._tracks[tid].class_name] += 1
 
+        dwell_summary = self.get_dwell_summary()
+
         return {
             "total_frames": self._latest_frame_idx,
             "duration_sec": round(self._latest_timestamp, 2),
@@ -671,11 +940,19 @@ class SpatialAnalytics:
             "roi_occupancy": {
                 "current_inside": len(self._roi_current_inside),
                 "current_classes": dict(current_roi_classes),
+                "peak_occupancy": self._peak_roi_occupancy,
+                "peak_frame": self._peak_roi_frame,
+                "peak_timestamp": self._peak_roi_timestamp,
                 "entries_total": self._roi_entries_total,
                 "entries_by_class": dict(self._roi_entries_by_class),
                 "exits_total": self._roi_exits_total,
                 "exits_by_class": dict(self._roi_exits_by_class),
-                "terminated_inside": self._roi_terminated_inside_total
+                "terminated_inside": self._roi_terminated_inside_total,
+                "completed_visits_count": self._completed_dwell_count,
+                "total_completed_dwell_sec": dwell_summary["total_completed_dwell_sec"],
+                "avg_completed_dwell_sec": dwell_summary["avg_completed_dwell_sec"],
+                "avg_completed_dwell_by_class": dwell_summary["avg_completed_dwell_by_class"],
+                "dwell_summary": dwell_summary
             },
             "total_events_logged": len(self._events),
             "recent_events": self.get_events(limit=10)

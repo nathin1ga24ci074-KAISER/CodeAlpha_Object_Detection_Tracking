@@ -19,6 +19,8 @@ from src.spatial_analytics import (
     SpatialAnalytics,
     CrossingDirection,
     RegionState,
+    ROIVisitStatus,
+    ROIVisitRecord,
     SpatialEvent,
     validate_line_coords,
     validate_roi_coords,
@@ -416,3 +418,351 @@ class TestSessionIsolationAndTelemetry:
         assert res["spatial_analytics"] is not None
         assert "line_crossings" in res["spatial_analytics"]
         assert "roi_occupancy" in res["spatial_analytics"]
+
+
+class TestROIDwellAndPeakOccupancy:
+    """
+    Validates Stage 1: ROI dwell time analytics, peak occupancy tracking,
+    bounded visit history, multi-class averages, and graceful stream finalization.
+    """
+
+    def test_roi_entry_creates_in_progress_visit(self):
+        analytics = SpatialAnalytics(roi_region=(100, 100, 400, 400))
+        t = MockTrack(1, "person", (200, 200))
+        res = analytics.update(frame_idx=10, tracks=[t], timestamp_sec=1.5)
+
+        assert res["roi_current_occupancy"] == 1
+        active = analytics.get_active_roi_visits()
+        assert len(active) == 1
+        v = active[0]
+        assert v["track_id"] == 1
+        assert v["class_name"] == "person"
+        assert v["status"] == ROIVisitStatus.IN_PROGRESS
+        assert v["entry_frame"] == 10
+        assert v["entry_timestamp"] == 1.5
+        assert v["exit_frame"] is None
+        assert v["exit_timestamp"] is None
+        assert v["dwell_duration_sec"] == 0.0
+
+        # At subsequent frame 20 (ts=2.5), elapsed duration is 1.0s
+        analytics.update(frame_idx=20, tracks=[t], timestamp_sec=2.5)
+        dwell_sum = analytics.get_dwell_summary()
+        assert dwell_sum["current_inside_count"] == 1
+        assert dwell_sum["active_visits"][0]["dwell_duration_sec"] == 1.0
+
+    def test_geometric_exit_completes_visit_with_accurate_dwell(self):
+        analytics = SpatialAnalytics(roi_region=(100, 100, 400, 400))
+        # Entry at frame 10 (1.0s)
+        analytics.update(frame_idx=10, tracks=[MockTrack(2, "car", (250, 250))], timestamp_sec=1.0)
+        # Sustained inside at frame 20 (2.5s)
+        analytics.update(frame_idx=20, tracks=[MockTrack(2, "car", (260, 250))], timestamp_sec=2.5)
+        # Geometric exit at frame 30 (4.25s)
+        res3 = analytics.update(frame_idx=30, tracks=[MockTrack(2, "car", (500, 250))], timestamp_sec=4.25)
+
+        assert res3["roi_current_occupancy"] == 0
+        assert res3["roi_exits_total"] == 1
+        assert res3["roi_completed_visits"] == 1
+        assert res3["roi_avg_dwell_sec"] == 3.25
+
+        active = analytics.get_active_roi_visits()
+        assert len(active) == 0
+
+        completed = analytics.get_completed_roi_visits()
+        assert len(completed) == 1
+        c = completed[0]
+        assert c["track_id"] == 2
+        assert c["class_name"] == "car"
+        assert c["status"] == ROIVisitStatus.COMPLETED
+        assert c["entry_frame"] == 10
+        assert c["entry_timestamp"] == 1.0
+        assert c["exit_frame"] == 30
+        assert c["exit_timestamp"] == 4.25
+        assert c["dwell_duration_sec"] == 3.25
+
+    def test_peak_occupancy_tracks_concurrent_objects_and_preserves_peak(self):
+        analytics = SpatialAnalytics(roi_region=(100, 100, 400, 400))
+        assert analytics.get_dwell_summary()["peak_occupancy"] == 0
+        assert analytics.get_dwell_summary()["peak_frame"] is None
+
+        # Frame 1: 1 object inside
+        res1 = analytics.update(frame_idx=1, tracks=[MockTrack(1, "person", (200, 200))], timestamp_sec=0.1)
+        assert res1["roi_peak_occupancy"] == 1
+        assert res1["roi_peak_frame"] == 1
+
+        # Frame 2: 3 objects inside concurrently
+        res2 = analytics.update(
+            frame_idx=2,
+            tracks=[
+                MockTrack(1, "person", (200, 200)),
+                MockTrack(2, "person", (220, 220)),
+                MockTrack(3, "person", (240, 240))
+            ],
+            timestamp_sec=0.2
+        )
+        assert res2["roi_peak_occupancy"] == 3
+        assert res2["roi_peak_frame"] == 2
+        assert res2["roi_peak_timestamp"] == 0.2
+
+        # Frame 3: 2 objects exit (only 1 remains)
+        res3 = analytics.update(
+            frame_idx=3,
+            tracks=[
+                MockTrack(1, "person", (200, 200)),
+                MockTrack(2, "person", (50, 220)),
+                MockTrack(3, "person", (50, 240))
+            ],
+            timestamp_sec=0.3
+        )
+        assert res3["roi_current_occupancy"] == 1
+        # Peak remains 3 at frame 2
+        assert res3["roi_peak_occupancy"] == 3
+        assert res3["roi_peak_frame"] == 2
+        assert res3["roi_peak_timestamp"] == 0.2
+
+        summary = analytics.get_summary()["roi_occupancy"]
+        assert summary["peak_occupancy"] == 3
+        assert summary["peak_frame"] == 2
+        assert summary["peak_timestamp"] == 0.2
+
+    def test_completed_average_excludes_in_progress_and_terminated_visits(self):
+        analytics = SpatialAnalytics(roi_region=(100, 100, 400, 400), disappearance_grace_frames=2)
+        # Track 1 enters at 1.0s, exits at 5.0s -> completed dwell 4.0s
+        analytics.update(frame_idx=1, tracks=[MockTrack(1, "car", (200, 200))], timestamp_sec=1.0)
+        analytics.update(frame_idx=5, tracks=[MockTrack(1, "car", (50, 200))], timestamp_sec=5.0)
+
+        # Track 2 enters at 6.0s, remains inside (in-progress)
+        analytics.update(frame_idx=6, tracks=[MockTrack(2, "car", (220, 220))], timestamp_sec=6.0)
+
+        # Track 3 enters at 7.0s, disappears inside (terminated)
+        analytics.update(
+            frame_idx=7,
+            tracks=[MockTrack(2, "car", (220, 220)), MockTrack(3, "car", (240, 240))],
+            timestamp_sec=7.0
+        )
+        analytics.update(frame_idx=8, tracks=[MockTrack(2, "car", (220, 220))], timestamp_sec=8.0)
+        analytics.update(frame_idx=9, tracks=[MockTrack(2, "car", (220, 220))], timestamp_sec=9.0)
+        analytics.update(frame_idx=10, tracks=[MockTrack(2, "car", (220, 220))], timestamp_sec=10.0)
+
+        dwell_sum = analytics.get_dwell_summary()
+        assert dwell_sum["completed_visits_count"] == 1
+        assert dwell_sum["avg_completed_dwell_sec"] == 4.0
+        assert dwell_sum["total_completed_dwell_sec"] == 4.0
+        assert dwell_sum["current_inside_count"] == 1  # Track 2
+        assert dwell_sum["terminated_inside_count"] == 1  # Track 3
+        assert len(analytics.get_active_roi_visits()) == 1
+        assert len(analytics.get_terminated_roi_visits()) == 1
+
+    def test_track_disappearance_creates_terminated_inside_visit(self):
+        analytics = SpatialAnalytics(roi_region=(100, 100, 400, 400), disappearance_grace_frames=3)
+        # Enters at frame 10 (1.0s), last seen at frame 12 (1.2s)
+        analytics.update(frame_idx=10, tracks=[MockTrack(5, "truck", (200, 200))], timestamp_sec=1.0)
+        analytics.update(frame_idx=11, tracks=[MockTrack(5, "truck", (205, 205))], timestamp_sec=1.1)
+        analytics.update(frame_idx=12, tracks=[MockTrack(5, "truck", (210, 210))], timestamp_sec=1.2)
+
+        # Disappears for 3 frames >= grace period
+        analytics.update(frame_idx=13, tracks=[], timestamp_sec=1.3)
+        analytics.update(frame_idx=14, tracks=[], timestamp_sec=1.4)
+        res15 = analytics.update(frame_idx=15, tracks=[], timestamp_sec=1.5)
+
+        assert res15["roi_exits_total"] == 0
+        assert res15["roi_terminated_inside"] == 1
+        assert res15["roi_completed_visits"] == 0
+
+        terminated = analytics.get_terminated_roi_visits()
+        assert len(terminated) == 1
+        t = terminated[0]
+        assert t["track_id"] == 5
+        assert t["class_name"] == "truck"
+        assert t["status"] == ROIVisitStatus.TERMINATED_INSIDE
+        assert t["entry_frame"] == 10
+        assert t["entry_timestamp"] == 1.0
+        assert t["exit_frame"] == 12
+        assert t["exit_timestamp"] == 1.2
+        assert t["dwell_duration_sec"] == 0.2
+        assert len(analytics.get_completed_roi_visits()) == 0
+
+    def test_stream_finalization_finalizes_in_progress_visits(self):
+        analytics = SpatialAnalytics(roi_region=(100, 100, 400, 400))
+        analytics.update(frame_idx=1, tracks=[MockTrack(1, "person", (200, 200))], timestamp_sec=0.1)
+        analytics.update(
+            frame_idx=2,
+            tracks=[MockTrack(1, "person", (200, 200)), MockTrack(2, "dog", (250, 250))],
+            timestamp_sec=0.2
+        )
+
+        assert len(analytics.get_active_roi_visits()) == 2
+        analytics.finalize_stream(last_frame_idx=20, timestamp_sec=2.0)
+
+        assert len(analytics.get_active_roi_visits()) == 0
+        assert analytics.get_summary()["roi_occupancy"]["current_inside"] == 0
+        assert analytics.get_summary()["roi_occupancy"]["terminated_inside"] == 2
+        assert analytics.get_summary()["roi_occupancy"]["exits_total"] == 0
+
+        term_visits = analytics.get_terminated_roi_visits()
+        assert len(term_visits) == 2
+        for v in term_visits:
+            assert v["status"] == ROIVisitStatus.TERMINATED_INSIDE
+            assert v["exit_frame"] == 20
+            assert v["exit_timestamp"] == 2.0
+
+    def test_repeated_stream_finalization_is_idempotent(self):
+        analytics = SpatialAnalytics(roi_region=(100, 100, 400, 400))
+        analytics.update(frame_idx=1, tracks=[MockTrack(1, "person", (200, 200))], timestamp_sec=0.1)
+
+        analytics.finalize_stream(last_frame_idx=10, timestamp_sec=1.0)
+        assert analytics.get_summary()["roi_occupancy"]["terminated_inside"] == 1
+        assert len(analytics.get_terminated_roi_visits()) == 1
+
+        # Second finalize call must do nothing
+        analytics.finalize_stream(last_frame_idx=10, timestamp_sec=1.0)
+        assert analytics.get_summary()["roi_occupancy"]["terminated_inside"] == 1
+        assert len(analytics.get_terminated_roi_visits()) == 1
+
+    def test_terminated_inside_recovery_and_reentry_creates_new_visit(self):
+        analytics = SpatialAnalytics(roi_region=(100, 100, 400, 400), disappearance_grace_frames=2)
+        # 1. Track 10 enters at 1.0s, last seen at 2.0s
+        analytics.update(frame_idx=1, tracks=[MockTrack(10, "person", (200, 200))], timestamp_sec=1.0)
+        analytics.update(frame_idx=2, tracks=[MockTrack(10, "person", (200, 200))], timestamp_sec=2.0)
+
+        # Disappears and terminates
+        analytics.update(frame_idx=3, tracks=[], timestamp_sec=3.0)
+        analytics.update(frame_idx=4, tracks=[], timestamp_sec=4.0)
+        analytics.update(frame_idx=5, tracks=[], timestamp_sec=5.0)
+
+        assert analytics.get_summary()["roi_occupancy"]["terminated_inside"] == 1
+        term_visits = analytics.get_terminated_roi_visits()
+        assert len(term_visits) == 1
+        assert term_visits[0]["status"] == ROIVisitStatus.TERMINATED_INSIDE
+
+        # 2. Track 10 recovered solidly outside at 10.0s
+        analytics.update(frame_idx=10, tracks=[MockTrack(10, "person", (50, 200))], timestamp_sec=10.0)
+
+        # 3. Track 10 re-enters at 12.0s
+        analytics.update(frame_idx=12, tracks=[MockTrack(10, "person", (200, 200))], timestamp_sec=12.0)
+        assert len(analytics.get_active_roi_visits()) == 1
+        v2 = analytics.get_active_roi_visits()[0]
+        assert v2["track_id"] == 10
+        assert v2["entry_frame"] == 12
+        assert v2["entry_timestamp"] == 12.0
+
+        # 4. Track 10 exits at 15.0s
+        analytics.update(frame_idx=15, tracks=[MockTrack(10, "person", (50, 200))], timestamp_sec=15.0)
+        assert len(analytics.get_active_roi_visits()) == 0
+        comp_visits = analytics.get_completed_roi_visits()
+        assert len(comp_visits) == 1
+        assert comp_visits[0]["dwell_duration_sec"] == 3.0
+
+        # History integrity: 1 terminated visit, 1 completed visit, 0 active
+        summary = analytics.get_summary()["roi_occupancy"]
+        assert summary["entries_total"] == 2
+        assert summary["exits_total"] == 1
+        assert summary["terminated_inside"] == 1
+        assert summary["current_inside"] == 0
+
+    def test_multi_class_separate_dwell_averages(self):
+        analytics = SpatialAnalytics(roi_region=(100, 100, 400, 400))
+        # Person 1 dwells 2.0s
+        analytics.update(frame_idx=1, tracks=[MockTrack(1, "person", (200, 200))], timestamp_sec=1.0)
+        analytics.update(frame_idx=2, tracks=[MockTrack(1, "person", (50, 200))], timestamp_sec=3.0)
+
+        # Person 2 dwells 4.0s
+        analytics.update(frame_idx=3, tracks=[MockTrack(2, "person", (200, 200))], timestamp_sec=4.0)
+        analytics.update(frame_idx=4, tracks=[MockTrack(2, "person", (50, 200))], timestamp_sec=8.0)
+
+        # Car 3 dwells 10.0s
+        analytics.update(frame_idx=5, tracks=[MockTrack(3, "car", (200, 200))], timestamp_sec=10.0)
+        analytics.update(frame_idx=6, tracks=[MockTrack(3, "car", (50, 200))], timestamp_sec=20.0)
+
+        dwell_sum = analytics.get_dwell_summary()
+        assert dwell_sum["completed_visits_count"] == 3
+        # Person avg: (2.0 + 4.0) / 2 = 3.0s
+        assert dwell_sum["avg_completed_dwell_by_class"]["person"] == 3.0
+        # Car avg: 10.0s
+        assert dwell_sum["avg_completed_dwell_by_class"]["car"] == 10.0
+        # Overall avg: (2.0 + 4.0 + 10.0) / 3 = 16.0 / 3 = 5.33s
+        assert dwell_sum["avg_completed_dwell_sec"] == 5.33
+        assert dwell_sum["min_completed_dwell_sec"] == 2.0
+        assert dwell_sum["max_completed_dwell_sec"] == 10.0
+
+    def test_timestamp_fallback_and_negative_duration_guard(self):
+        analytics = SpatialAnalytics(roi_region=(100, 100, 400, 400))
+        # Frame 30, fps=30.0 -> ts=1.0
+        res1 = analytics.update(
+            frame_idx=30,
+            tracks=[MockTrack(1, "person", (200, 200))],
+            timestamp_sec=None,
+            fps=30.0
+        )
+        assert res1["timestamp_sec"] == 1.0
+
+        # Frame 60, non-finite NaN timestamp falls back to 60/30 = 2.0
+        res2 = analytics.update(
+            frame_idx=60,
+            tracks=[MockTrack(1, "person", (200, 200))],
+            timestamp_sec=float("nan"),
+            fps=30.0
+        )
+        assert res2["timestamp_sec"] == 2.0
+
+        # Negative timestamp clamped / falls back to frame_idx / fps
+        res3 = analytics.update(
+            frame_idx=90,
+            tracks=[MockTrack(1, "person", (50, 200))],
+            timestamp_sec=-5.0,
+            fps=30.0
+        )
+        assert res3["timestamp_sec"] == 3.0
+        assert res3["roi_completed_visits"] == 1
+        assert res3["roi_avg_dwell_sec"] == 2.0  # 3.0s - 1.0s = 2.0s
+
+    def test_session_reset_clears_dwell_and_peak_state(self):
+        analytics = SpatialAnalytics(roi_region=(100, 100, 400, 400))
+        analytics.update(frame_idx=1, tracks=[MockTrack(1, "person", (200, 200))], timestamp_sec=1.0)
+        analytics.update(frame_idx=2, tracks=[MockTrack(1, "person", (50, 200))], timestamp_sec=3.0)
+        analytics.update(frame_idx=3, tracks=[MockTrack(2, "car", (200, 200))], timestamp_sec=4.0)
+
+        dwell_before = analytics.get_dwell_summary()
+        assert dwell_before["peak_occupancy"] == 1
+        assert dwell_before["completed_visits_count"] == 1
+        assert dwell_before["current_inside_count"] == 1
+
+        analytics.reset()
+        dwell_after = analytics.get_dwell_summary()
+        assert dwell_after["peak_occupancy"] == 0
+        assert dwell_after["peak_frame"] is None
+        assert dwell_after["peak_timestamp"] is None
+        assert dwell_after["completed_visits_count"] == 0
+        assert dwell_after["total_completed_dwell_sec"] == 0.0
+        assert dwell_after["avg_completed_dwell_sec"] == 0.0
+        assert dwell_after["current_inside_count"] == 0
+        assert dwell_after["active_visits"] == []
+        assert dwell_after["recent_completed_visits"] == []
+        assert dwell_after["recent_terminated_visits"] == []
+
+    def test_bounded_history_pruning_preserves_cumulative_metrics(self):
+        # Configure max_visits_history=2
+        analytics = SpatialAnalytics(roi_region=(100, 100, 400, 400), max_visits_history=2)
+
+        # Complete 5 visits of 3.0s each
+        for i in range(1, 6):
+            analytics.update(
+                frame_idx=i * 10,
+                tracks=[MockTrack(i, "person", (200, 200))],
+                timestamp_sec=float(i * 10)
+            )
+            analytics.update(
+                frame_idx=i * 10 + 3,
+                tracks=[MockTrack(i, "person", (50, 200))],
+                timestamp_sec=float(i * 10 + 3)
+            )
+
+        # Recent history list is bounded to 2
+        assert len(analytics.get_completed_roi_visits()) == 2
+        assert len(analytics._completed_roi_visits) == 2
+
+        # Cumulative running metrics are NOT truncated or corrupted!
+        dwell_sum = analytics.get_dwell_summary()
+        assert dwell_sum["completed_visits_count"] == 5
+        assert dwell_sum["total_completed_dwell_sec"] == 15.0
+        assert dwell_sum["avg_completed_dwell_sec"] == 3.0
+        assert dwell_sum["avg_completed_dwell_by_class"]["person"] == 3.0

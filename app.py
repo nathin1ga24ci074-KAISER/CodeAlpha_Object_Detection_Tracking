@@ -18,10 +18,34 @@ from src.tracker import ObjectTracker, TrackedObject
 from src.video_source import VideoSource
 from src.scene_intelligence import SceneIntelligence
 from src.spatial_analytics import SpatialAnalytics, parse_spatial_coords_string
+from src.behavior_analytics import BehaviorAnalytics
+from src.heatmap_analytics import HeatmapAnalytics
 from src.utils import draw_bounding_box, draw_trajectory, draw_hud, ColorPalette, FPSMeter
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+
+
+def print_behavior_summary(behavior: Dict[str, Any]) -> None:
+    """Prints clear, explainable trajectory behavior analytics summary to console."""
+    if not behavior:
+        return
+    print("Trajectory Behavior Analytics:")
+    print(f"  Tracks Analyzed: {behavior['total_tracks_analyzed']} total "
+          f"({behavior['completed_tracks_count']} completed, {behavior['active_tracks_count']} active at termination)")
+    print(f"  Average Path Length:     {behavior['avg_path_length_px']} px")
+    print(f"  Average Displacement:    {behavior['avg_net_displacement_px']} px")
+    print(f"  Average Tortuosity:      {behavior['avg_tortuosity']:.2f}")
+    print(f"  Total Direction Changes: {behavior['total_direction_changes']}")
+    speed_str = f"{behavior['avg_speed_px_per_sec']} px/s" if behavior.get("avg_speed_px_per_sec") is not None else "N/A (reliable timing unavailable)"
+    print(f"  Average Speed:           {speed_str}")
+    if behavior.get("class_breakdown"):
+        print("  Per-Class Behavior:")
+        for cname, cdata in sorted(behavior["class_breakdown"].items()):
+            c_speed = f"{cdata['avg_speed_px_per_sec']} px/s" if cdata.get("avg_speed_px_per_sec") is not None else "N/A"
+            print(f"    - {cname:<12} Count: {cdata['track_count']:<3} | Avg Len: {cdata['avg_path_length_px']:>6.1f}px | Avg Disp: {cdata['avg_net_displacement_px']:>6.1f}px | Tort: {cdata['avg_tortuosity']:>4.2f} | Turns: {cdata['total_direction_changes']:<3} | Speed: {c_speed}")
+    print("-" * 64)
+
 
 
 def is_image_file(path_str: str) -> bool:
@@ -115,11 +139,17 @@ def run_video_tracking(
     max_frames: Optional[int] = None,
     show_trajectories: bool = True,
     virtual_line: Optional[Union[str, Tuple[int, int, int, int]]] = None,
-    roi_region: Optional[Union[str, Tuple[int, int, int, int]]] = None
+    roi_region: Optional[Union[str, Tuple[int, int, int, int]]] = None,
+    enable_heatmap: bool = False,
+    heatmap_output_dir: Optional[Union[str, Path]] = None,
+    heatmap_radius: int = 20,
+    heatmap_alpha: float = 0.5,
+    heatmap_decay: float = 1.0,
+    heatmap_threshold: float = 0.05
 ) -> Dict[str, Any]:
     """
     Executes real YOLO detection and ByteTrack association on a prerecorded video file.
-    Optionally computes virtual line crossing and rectangular ROI analytics.
+    Optionally computes virtual line crossing, rectangular ROI analytics, and spatial heatmaps.
     """
     path = Path(video_path)
     if not path.exists():
@@ -140,6 +170,19 @@ def run_video_tracking(
     )
     tracker.load_model()
     scene_intel = SceneIntelligence()
+    behavior_analytics = BehaviorAnalytics()
+
+    # Spatial heatmap analytics initialization
+    heatmap_analytics: Optional[HeatmapAnalytics] = None
+    if enable_heatmap:
+        heatmap_analytics = HeatmapAnalytics(
+            frame_width=vs.width,
+            frame_height=vs.height,
+            radius_px=heatmap_radius,
+            decay_factor=heatmap_decay,
+            overlay_alpha=heatmap_alpha,
+            min_density_threshold=heatmap_threshold
+        )
 
     # Spatial analytics initialization
     spatial_analytics = None
@@ -164,6 +207,9 @@ def run_video_tracking(
             out_dir.mkdir(parents=True, exist_ok=True)
             out_p = out_dir / f"tracked_{path.stem}.mp4"
 
+        if out_p.resolve() == path.resolve():
+            raise ValueError(f"Output video path collides with source video: {path}")
+
         out_p.parent.mkdir(parents=True, exist_ok=True)
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(out_p.resolve()), fourcc, vs.fps, (vs.width, vs.height))
@@ -172,6 +218,7 @@ def run_video_tracking(
     fps_meter = FPSMeter()
     track_history: Dict[int, Dict[str, Any]] = {}
     frames_processed = 0
+    last_raw_frame: Optional[np.ndarray] = None
     t_start = time.perf_counter()
 
     try:
@@ -181,6 +228,7 @@ def run_video_tracking(
                 break
 
             frames_processed += 1
+            last_raw_frame = frame
             tracks = tracker.track(frame)
             current_fps = fps_meter.tick()
 
@@ -197,6 +245,18 @@ def run_video_tracking(
                     tracks=tracks,
                     timestamp_sec=frames_processed / fps_for_time,
                     fps=fps_for_time
+                )
+            behavior_analytics.update(
+                frame_idx=frames_processed,
+                tracks=tracks,
+                timestamp_sec=frames_processed / fps_for_time,
+                fps=fps_for_time
+            )
+            if heatmap_analytics is not None:
+                heatmap_analytics.update(
+                    tracks=tracks,
+                    frame_idx=frames_processed,
+                    timestamp_sec=frames_processed / fps_for_time
                 )
 
             annotated = frame.copy()
@@ -257,9 +317,71 @@ def run_video_tracking(
                 spatial_analytics.finalize_stream(last_frame_idx=frames_processed)
             except Exception:
                 pass
+        try:
+            behavior_analytics.finalize_stream(last_frame_idx=frames_processed)
+        except Exception:
+            pass
 
     total_duration = time.perf_counter() - t_start
     avg_fps = (frames_processed / total_duration) if total_duration > 0 else 0.0
+
+    heatmap_result: Optional[Dict[str, Any]] = None
+    if heatmap_analytics is not None:
+        if heatmap_output_dir:
+            hm_out_dir = Path(heatmap_output_dir)
+        elif isinstance(save_path, str):
+            hm_out_dir = Path(save_path).parent
+        else:
+            hm_out_dir = Path(__file__).resolve().parent / "outputs"
+
+        hm_out_dir.mkdir(parents=True, exist_ok=True)
+        heatmap_img_path = hm_out_dir / f"heatmap_{path.stem}.png"
+        overlay_img_path = hm_out_dir / f"heatmap_overlay_{path.stem}.png"
+
+        src_resolved = path.resolve()
+        if heatmap_img_path.resolve() == src_resolved or overlay_img_path.resolve() == src_resolved:
+            raise ValueError(f"Heatmap output path collides with source video: {path}")
+
+        heatmap_img = heatmap_analytics.generate_heatmap_image(normalize=True)
+        base_frame = (
+            last_raw_frame
+            if last_raw_frame is not None
+            else np.zeros((vs.height, vs.width, 3), dtype=np.uint8)
+        )
+        overlay_img = heatmap_analytics.apply_overlay(
+            base_frame,
+            alpha=heatmap_alpha,
+            min_density_threshold=heatmap_threshold
+        )
+
+        first_created = False
+        first_existed = heatmap_img_path.exists()
+        success_hm = cv2.imwrite(str(heatmap_img_path.resolve()), heatmap_img)
+        if not success_hm:
+            raise IOError(f"Failed to write heatmap image to: {heatmap_img_path}")
+        first_created = not first_existed and heatmap_img_path.exists()
+
+        try:
+            success_ov = cv2.imwrite(str(overlay_img_path.resolve()), overlay_img)
+            if not success_ov:
+                raise IOError(f"Failed to write heatmap overlay image to: {overlay_img_path}")
+        except Exception as err:
+            if first_created and heatmap_img_path.exists():
+                try:
+                    heatmap_img_path.unlink()
+                except Exception:
+                    pass
+            if isinstance(err, IOError):
+                raise
+            raise IOError(f"Failed to write heatmap overlay image to: {overlay_img_path}") from err
+
+        heatmap_result = {
+            "enabled": True,
+            "heatmap_image_path": str(heatmap_img_path.resolve()),
+            "overlay_image_path": str(overlay_img_path.resolve()),
+            "summary": heatmap_analytics.get_summary(),
+            "density_map": heatmap_analytics.get_density_map(copy=True)
+        }
 
     track_summaries = []
     for tid, info in track_history.items():
@@ -285,7 +407,9 @@ def run_video_tracking(
         "average_fps": round(avg_fps, 2),
         "tracks": sorted(track_summaries, key=lambda x: x["track_id"]),
         "scene_intelligence": scene_intel.get_session_report(),
-        "spatial_analytics": spatial_analytics.get_summary() if spatial_analytics is not None else None
+        "spatial_analytics": spatial_analytics.get_summary() if spatial_analytics is not None else None,
+        "behavior_analytics": behavior_analytics.get_summary(),
+        "heatmap": heatmap_result
     }
 
 
@@ -300,12 +424,18 @@ def run_webcam_tracking(
     show_trajectories: bool = True,
     headless: bool = False,
     virtual_line: Optional[Union[str, Tuple[int, int, int, int]]] = None,
-    roi_region: Optional[Union[str, Tuple[int, int, int, int]]] = None
+    roi_region: Optional[Union[str, Tuple[int, int, int, int]]] = None,
+    enable_heatmap: bool = False,
+    heatmap_output_dir: Optional[Union[str, Path]] = None,
+    heatmap_radius: int = 20,
+    heatmap_alpha: float = 0.5,
+    heatmap_decay: float = 1.0,
+    heatmap_threshold: float = 0.05
 ) -> Dict[str, Any]:
     """
     Executes live YOLO detection and ByteTrack association on an interactive webcam stream.
     Displays OpenCV visualization window with 'Q' or 'ESC' exit handlers.
-    Optionally computes virtual line crossing and rectangular ROI analytics.
+    Optionally computes virtual line crossing, rectangular ROI analytics, and spatial heatmaps.
     """
     vs = VideoSource(webcam_id)
     try:
@@ -321,6 +451,19 @@ def run_webcam_tracking(
     )
     tracker.load_model()
     scene_intel = SceneIntelligence()
+    behavior_analytics = BehaviorAnalytics()
+
+    # Spatial heatmap analytics initialization
+    heatmap_analytics: Optional[HeatmapAnalytics] = None
+    if enable_heatmap and vs.width > 0 and vs.height > 0:
+        heatmap_analytics = HeatmapAnalytics(
+            frame_width=vs.width,
+            frame_height=vs.height,
+            radius_px=heatmap_radius,
+            decay_factor=heatmap_decay,
+            overlay_alpha=heatmap_alpha,
+            min_density_threshold=heatmap_threshold
+        )
 
     # Spatial analytics initialization
     spatial_analytics = None
@@ -355,6 +498,7 @@ def run_webcam_tracking(
     fps_meter = FPSMeter()
     track_history: Dict[int, Dict[str, Any]] = {}
     frames_processed = 0
+    last_raw_frame: Optional[np.ndarray] = None
     t_start = time.perf_counter()
     window_name = "CodeAlpha — Live Webcam Tracking (Press 'q' or 'Esc' to exit)"
 
@@ -366,6 +510,18 @@ def run_webcam_tracking(
                 break
 
             frames_processed += 1
+            last_raw_frame = frame
+
+            if enable_heatmap and heatmap_analytics is None:
+                heatmap_analytics = HeatmapAnalytics(
+                    frame_width=frame.shape[1],
+                    frame_height=frame.shape[0],
+                    radius_px=heatmap_radius,
+                    decay_factor=heatmap_decay,
+                    overlay_alpha=heatmap_alpha,
+                    min_density_threshold=heatmap_threshold
+                )
+
             tracks = tracker.track(frame)
             current_fps = fps_meter.tick()
 
@@ -382,6 +538,18 @@ def run_webcam_tracking(
                     tracks=tracks,
                     timestamp_sec=frames_processed / fps_for_time,
                     fps=fps_for_time
+                )
+            behavior_analytics.update(
+                frame_idx=frames_processed,
+                tracks=tracks,
+                timestamp_sec=frames_processed / fps_for_time,
+                fps=fps_for_time
+            )
+            if heatmap_analytics is not None:
+                heatmap_analytics.update(
+                    tracks=tracks,
+                    frame_idx=frames_processed,
+                    timestamp_sec=frames_processed / fps_for_time
                 )
 
             annotated = frame.copy()
@@ -451,9 +619,92 @@ def run_webcam_tracking(
                 spatial_analytics.finalize_stream(last_frame_idx=frames_processed)
             except Exception:
                 pass
+        try:
+            behavior_analytics.finalize_stream(last_frame_idx=frames_processed)
+        except Exception:
+            pass
 
     total_duration = time.perf_counter() - t_start
     avg_fps = (frames_processed / total_duration) if total_duration > 0 else 0.0
+
+    heatmap_result: Optional[Dict[str, Any]] = None
+    if enable_heatmap:
+        if heatmap_analytics is not None:
+            if heatmap_output_dir:
+                hm_out_dir = Path(heatmap_output_dir)
+            elif isinstance(save_path, str):
+                hm_out_dir = Path(save_path).parent
+            else:
+                hm_out_dir = Path(__file__).resolve().parent / "outputs"
+
+            hm_out_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = int(time.time())
+            heatmap_img_path = hm_out_dir / f"heatmap_webcam_{webcam_id}_{timestamp}.png"
+            overlay_img_path = hm_out_dir / f"heatmap_overlay_webcam_{webcam_id}_{timestamp}.png"
+            counter = 1
+            while heatmap_img_path.exists() or overlay_img_path.exists():
+                heatmap_img_path = hm_out_dir / f"heatmap_webcam_{webcam_id}_{timestamp}_{counter}.png"
+                overlay_img_path = hm_out_dir / f"heatmap_overlay_webcam_{webcam_id}_{timestamp}_{counter}.png"
+                counter += 1
+
+            if out_file_path is not None:
+                video_out_res = Path(out_file_path).resolve()
+                if heatmap_img_path.resolve() == video_out_res or overlay_img_path.resolve() == video_out_res:
+                    raise ValueError(f"Heatmap output path collides with output video: {out_file_path}")
+
+            heatmap_img = heatmap_analytics.generate_heatmap_image(normalize=True)
+            base_frame = (
+                last_raw_frame
+                if last_raw_frame is not None
+                else np.zeros((vs.height, vs.width, 3), dtype=np.uint8)
+            )
+            overlay_img = heatmap_analytics.apply_overlay(
+                base_frame,
+                alpha=heatmap_alpha,
+                min_density_threshold=heatmap_threshold
+            )
+
+            first_created = False
+            first_existed = heatmap_img_path.exists()
+            success_hm = cv2.imwrite(str(heatmap_img_path.resolve()), heatmap_img)
+            if not success_hm:
+                raise IOError(f"Failed to write webcam heatmap image to: {heatmap_img_path}")
+            first_created = not first_existed and heatmap_img_path.exists()
+
+            try:
+                success_ov = cv2.imwrite(str(overlay_img_path.resolve()), overlay_img)
+                if not success_ov:
+                    raise IOError(f"Failed to write webcam heatmap overlay image to: {overlay_img_path}")
+            except Exception as err:
+                if first_created and heatmap_img_path.exists():
+                    try:
+                        heatmap_img_path.unlink()
+                    except Exception:
+                        pass
+                if isinstance(err, IOError):
+                    raise
+                raise IOError(f"Failed to write webcam heatmap overlay image to: {overlay_img_path}") from err
+
+            heatmap_result = {
+                "enabled": True,
+                "heatmap_image_path": str(heatmap_img_path.resolve()),
+                "overlay_image_path": str(overlay_img_path.resolve()),
+                "summary": heatmap_analytics.get_summary(),
+                "density_map": heatmap_analytics.get_density_map(copy=True)
+            }
+        else:
+            heatmap_result = {
+                "enabled": True,
+                "heatmap_image_path": None,
+                "overlay_image_path": None,
+                "summary": {
+                    "status": "No usable webcam frames were captured",
+                    "frames_processed": 0,
+                    "total_points_accumulated": 0,
+                    "is_empty": True
+                },
+                "density_map": None
+            }
 
     track_summaries = []
     for tid, info in track_history.items():
@@ -479,7 +730,9 @@ def run_webcam_tracking(
         "average_fps": round(avg_fps, 2),
         "tracks": sorted(track_summaries, key=lambda x: x["track_id"]),
         "scene_intelligence": scene_intel.get_session_report(),
-        "spatial_analytics": spatial_analytics.get_summary() if spatial_analytics is not None else None
+        "spatial_analytics": spatial_analytics.get_summary() if spatial_analytics is not None else None,
+        "behavior_analytics": behavior_analytics.get_summary(),
+        "heatmap": heatmap_result
     }
 
 
@@ -547,6 +800,17 @@ def parse_args():
         "--spatial-demo",
         action="store_true",
         help="Enable default demonstration virtual line and ROI for video/webcam tracking"
+    )
+    parser.add_argument(
+        "--heatmap",
+        action="store_true",
+        help="Enable spatial occupancy heatmap generation and image exports for video and webcam tracking"
+    )
+    parser.add_argument(
+        "--heatmap-dir",
+        type=str,
+        default=None,
+        help="Optional custom directory to save heatmap and overlay images (default: outputs/)"
     )
     parser.add_argument(
         "--headless",
@@ -630,6 +894,8 @@ def main():
             print(f"ROI Region:   {args.roi}")
         if args.spatial_demo:
             print("Spatial Demo: Enabled (Default demo line and ROI active)")
+        if args.heatmap:
+            print(f"Heatmap:      Enabled (Outputs to: {args.heatmap_dir or 'outputs/'})")
         if args.max_frames:
             print(f"Max frames:   {args.max_frames}")
         print("Processing video stream with ByteTrack...")
@@ -652,7 +918,9 @@ def main():
                 save_path=save_dest,
                 max_frames=args.max_frames,
                 virtual_line=line_arg,
-                roi_region=roi_arg
+                roi_region=roi_arg,
+                enable_heatmap=args.heatmap,
+                heatmap_output_dir=args.heatmap_dir
             )
         except Exception as err:
             print(f"\n[ERROR] Tracking failed: {err}", file=sys.stderr)
@@ -700,6 +968,16 @@ def main():
                 for ev in recent_spatial[-8:]:
                     print(f"  [{ev['timestamp_sec']:>5.2f}s | Frame {ev['frame_idx']:>3}] {ev['description']}")
             print("-" * 64)
+        if res.get("behavior_analytics"):
+            print_behavior_summary(res["behavior_analytics"])
+        if res.get("heatmap"):
+            hm = res["heatmap"]
+            print("Spatial Heatmap Analytics:")
+            print(f"  Points Accumulated: {hm['summary']['total_points_accumulated']}")
+            print(f"  Max Density:        {hm['summary']['max_density']}")
+            print(f"  Heatmap Image:      {hm['heatmap_image_path']}")
+            print(f"  Overlay Image:      {hm['overlay_image_path']}")
+            print("-" * 64)
         if res["output_video"]:
             print(f"Annotated video output saved to:\n  {res['output_video']}")
         print("=" * 64)
@@ -722,6 +1000,8 @@ def main():
             print(f"ROI Region:   {args.roi}")
         if args.spatial_demo:
             print("Spatial Demo: Enabled (Default demo line and ROI active)")
+        if args.heatmap:
+            print(f"Heatmap:      Enabled (Outputs to: {args.heatmap_dir or 'outputs/'})")
         if not args.headless:
             print("Display:      OpenCV live window (Press 'q' or 'Esc' to quit)")
         print("Opening webcam stream...")
@@ -745,7 +1025,9 @@ def main():
                 max_frames=args.max_frames,
                 headless=args.headless,
                 virtual_line=line_arg,
-                roi_region=roi_arg
+                roi_region=roi_arg,
+                enable_heatmap=args.heatmap,
+                heatmap_output_dir=args.heatmap_dir
             )
         except Exception as err:
             print(f"\n[ERROR] Webcam tracking failed: {err}", file=sys.stderr)
@@ -790,6 +1072,19 @@ def main():
                 print("\nSpatial Events Timeline:")
                 for ev in recent_spatial[-8:]:
                     print(f"  [{ev['timestamp_sec']:>5.2f}s | Frame {ev['frame_idx']:>3}] {ev['description']}")
+            print("-" * 64)
+        if res.get("behavior_analytics"):
+            print_behavior_summary(res["behavior_analytics"])
+        if res.get("heatmap"):
+            hm = res["heatmap"]
+            print("Spatial Heatmap Analytics:")
+            if hm.get("summary"):
+                print(f"  Points Accumulated: {hm['summary'].get('total_points_accumulated', 0)}")
+                print(f"  Max Density:        {hm['summary'].get('max_density', 0.0)}")
+            if hm.get("heatmap_image_path"):
+                print(f"  Heatmap Image:      {hm['heatmap_image_path']}")
+            if hm.get("overlay_image_path"):
+                print(f"  Overlay Image:      {hm['overlay_image_path']}")
             print("-" * 64)
         if res["output_video"]:
             print(f"Annotated webcam video saved to:\n  {res['output_video']}")
