@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CodeAlpha — Object Detection &amp; Tracking Dashboard</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <header class="app-header">
+        <div class="header-left">
+            <div class="logo-icon">&#9678;</div>
+            <div class="title-group">
+                <h1>CodeAlpha Object Detection &amp; Tracking</h1>
+                <span class="subtitle">Ultralytics YOLO11 &amp; ByteTrack Real-Time Analytics Engine</span>
+            </div>
+        </div>
+        <div class="header-right">
+            <div class="status-indicator">
+                <span class="pulse-dot" id="connection-dot"></span>
+                <span id="connection-text">Connecting...</span>
+            </div>
+            <div class="session-badge" id="session-badge">IDLE</div>
+        </div>
+    </header>
+
+    <div class="dashboard-container">
+        <!-- LEFT SIDEBAR: CONTROLS & PARAMS -->
+        <aside class="sidebar">
+            <section class="panel control-panel">
+                <h2 class="panel-title">Stream Configuration</h2>
+
+                <!-- Source Selection -->
+                <div class="form-group">
+                    <label class="form-label">Video Source</label>
+                    <div class="radio-group">
+                        <label class="radio-label">
+                            <input type="radio" name="source_type" value="webcam" checked id="src-webcam">
+                            <span>Webcam (0)</span>
+                        </label>
+                        <label class="radio-label">
+                            <input type="radio" name="source_type" value="file" id="src-file">
+                            <span>Upload Video</span>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Upload Section (hidden by default) -->
+                <div class="form-group upload-section hidden" id="upload-box">
+                    <label class="form-label">Select Video File (.mp4, .avi, .mov)</label>
+                    <div class="file-drop-zone" id="drop-zone">
+                        <input type="file" id="video-file-input" accept=".mp4,.avi,.mov,.mkv,.webm" class="file-input">
+                        <div class="drop-text" id="drop-text">Click or drag video file here</div>
+                    </div>
+                    <div class="upload-progress hidden" id="upload-progress">Uploading: <span id="progress-text">0%</span></div>
+                    <div class="file-badge hidden" id="uploaded-file-badge">No file chosen</div>
+                </div>
+
+                <!-- Confidence Threshold -->
+                <div class="form-group">
+                    <div class="slider-header">
+                        <label class="form-label" for="conf-slider">Confidence Threshold</label>
+                        <span class="slider-value" id="conf-val">0.40</span>
+                    </div>
+                    <input type="range" id="conf-slider" min="0.10" max="0.90" step="0.05" value="0.40" class="range-slider">
+                </div>
+
+                <!-- Feature Toggles -->
+                <div class="form-group">
+                    <label class="form-label">Analytics Overlays</label>
+                    <div class="checkbox-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="toggle-line">
+                            <span>Virtual Line Crossing</span>
+                        </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="toggle-roi">
+                            <span>Rectangular ROI Analytics</span>
+                        </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="toggle-heatmap">
+                            <span>Spatial Occupancy Heatmap</span>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Primary Action Buttons -->
+                <div class="button-group">
+                    <button class="btn btn-primary" id="btn-start">&#9654; Start Stream</button>
+                    <button class="btn btn-danger" id="btn-stop" disabled>&#9632; Stop Stream</button>
+                </div>
+                <div class="notification-banner hidden" id="status-banner"></div>
+            </section>
+
+            <!-- EXPORT CENTER -->
+            <section class="panel export-panel">
+                <h2 class="panel-title">Data Exports</h2>
+                <div class="export-buttons">
+                    <a href="/api/export/json" class="btn btn-secondary" id="btn-export-json" download="session_report.json">
+                        &#128190; Export JSON Report
+                    </a>
+                    <a href="/api/export/heatmap" class="btn btn-secondary" id="btn-export-heatmap" download="heatmap.png">
+                        &#128444; Export Heatmap PNG
+                    </a>
+                </div>
+            </section>
+        </aside>
+
+        <!-- MAIN CONTENT AREA: VIEWPORT & TELEMETRY -->
+        <main class="main-content">
+            <!-- TOP KPI METRIC CARDS -->
+            <div class="kpi-grid">
+                <div class="kpi-card">
+                    <div class="kpi-label">Processing Rate</div>
+                    <div class="kpi-value" id="kpi-fps">0.0 <span class="kpi-unit">FPS</span></div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Active Objects</div>
+                    <div class="kpi-value" id="kpi-active">0</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Total Unique Seen</div>
+                    <div class="kpi-value" id="kpi-total">0</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Frames Processed</div>
+                    <div class="kpi-value" id="kpi-frames">0</div>
+                </div>
+            </div>
+
+            <!-- STREAM VIEWPORT -->
+            <section class="panel viewport-panel">
+                <div class="viewport-header">
+                    <div class="viewport-title">Live Vision Stream</div>
+                    <div class="stream-info">
+                        <span class="badge" id="stream-source-badge">Source: Webcam (0)</span>
+                    </div>
+                </div>
+                <div class="stream-wrapper">
+                    <img id="stream-image" src="/video_feed" alt="Video Stream" class="stream-img">
+                </div>
+            </section>
+
+            <!-- SCENE INTELLIGENCE NATURAL LANGUAGE SUMMARY -->
+            <section class="panel intelligence-panel">
+                <h2 class="panel-title">&#129504; Scene Intelligence Summary</h2>
+                <p class="summary-text" id="scene-summary-text">Session idle. Start a webcam stream or upload a video to generate explainable scene analytics.</p>
+                <div class="class-tags" id="class-tags-container">
+                    <!-- Dynamic class count tags will be injected here -->
+                </div>
+            </section>
+
+            <!-- DETAILED ANALYTICS GRID -->
+            <div class="analytics-split">
+                <!-- SPATIAL & ROI ANALYTICS -->
+                <section class="panel sub-panel">
+                    <h2 class="panel-title">&#9638; Spatial &amp; Region Analytics</h2>
+                    <div class="spatial-grid">
+                        <div class="stat-row">
+                            <span class="stat-name">Total Line Crossings:</span>
+                            <span class="stat-val" id="spatial-crossings-total">0</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-name">Directional Breakdown:</span>
+                            <span class="stat-val" id="spatial-crossings-dir">None</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-name">ROI Active Occupancy:</span>
+                            <span class="stat-val" id="roi-active-occupants">0</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-name">ROI Historic Peak:</span>
+                            <span class="stat-val" id="roi-peak-occupancy">0</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TRAJECTORY BEHAVIOR ANALYTICS -->
+                <section class="panel sub-panel">
+                    <h2 class="panel-title">&#128200; Trajectory Dynamics</h2>
+                    <div class="spatial-grid">
+                        <div class="stat-row">
+                            <span class="stat-name">Tracks Analyzed:</span>
+                            <span class="stat-val" id="behavior-tracks-count">0</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-name">Avg Path Length:</span>
+                            <span class="stat-val" id="behavior-avg-length">0.0 px</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-name">Avg Displacement:</span>
+                            <span class="stat-val" id="behavior-avg-disp">0.0 px</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-name">Avg Tortuosity:</span>
+                            <span class="stat-val" id="behavior-avg-tort">1.00</span>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- EVENT TIMELINE LOG -->
+            <section class="panel timeline-panel">
+                <h2 class="panel-title">&#128337; Event Activity Log</h2>
+                <div class="table-container">
+                    <table class="event-table">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Frame</th>
+                                <th>Object</th>
+                                <th>Event Type</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody id="event-table-body">
+                            <tr>
+                                <td colspan="5" class="empty-cell">No events logged yet.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
